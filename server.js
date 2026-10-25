@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword; Konto loeschen verlangt das Passwort, wenn ACCOUNT_DELETE_NEEDS_PASSWORD=true); steht VOR §21
 //  §43  NEUES PASSWORT SETZEN (POST /auth/reset-password: Token aus der Passwort-vergessen-Mail + neues Passwort; public, streng begrenzt); steht VOR §21
 //  §42  E-MAIL-STATUS (GET /account/email-status: none/pending/verified fuer den eigenen Spieler; Client darf PlayFab dafuer nicht fragen); steht VOR §21
 //  §41  KONTO-VORPRUEFUNG (POST /auth/exists: gibt es dieses Login-Nick/diese E-Mail? nur ja/nein, streng begrenzt); steht VOR §21
@@ -7083,6 +7084,16 @@ app.post('/account/delete', async (req, res) => {
         return res.status(503).json({ success: false, error: 'Die Konto-Löschung ist noch nicht freigeschaltet.' }); // LOCALIZE
     if (!req.body || req.body.confirm !== ACCOUNT_DELETE_CONFIRM)
         return res.status(400).json({ success: false, error: 'Bestätigung fehlt.' }); // LOCALIZE
+    // NEU 25.10.2026 (§44): Loeschen ist nicht umkehrbar -> aktuelles Passwort verlangen (Schalter, damit alte Clients bis zum neuen Build weiter loeschen koennen)
+    if (process.env.ACCOUNT_DELETE_NEEDS_PASSWORD === 'true') {
+        const pw = await verifyAccountPassword(playFabId, req.body.password);
+        if (!pw.ok) {
+            const msg = pw.reason === 'limited' ? 'Zu viele Versuche. Bitte warte ein paar Minuten.'
+                : pw.reason === 'error' ? 'Die Prüfung ist gerade nicht möglich. Bitte versuche es später erneut.'
+                : 'Das Passwort stimmt nicht.';   // LOCALIZE
+            return res.status(403).json({ success: false, error: msg, needPassword: true });
+        }
+    }
 
     try {
         const result = await runAccountDeleteExclusive(() => deleteAccountCompletely(playFabId));
@@ -12396,7 +12407,10 @@ app.post('/auth/exists', async (req, res) => {
     const ip = String(req.headers['cf-connecting-ip'] || '').trim() || (xff.length > 1 ? xff[xff.length - 2] : (xff[0] || 'direkt'));
     if (rateLimited('exists-ip|' + ip, 60, 600000) || rateLimited('exists-all', 3000, 3600000))
         return res.status(429).json({ success: false, error: 'Zu viele Anfragen. Bitte warte einen Moment.' });
-    if (!isMail && !/^[A-Za-z0-9_.\-]{3,20}$/.test(raw)) return res.json({ success: true, exists: false, kind: 'nick' });   // so ein Nick kann nicht existieren
+    // SICHERHEIT (25.10.2026): E-Mail-Adressen werden NIE geprueft. Eine Ja/Nein-Antwort verriete, ob eine bestimmte Person (z. B. max.mustermann@web.de) bei uns
+    // spielt - personenbezogen. Das Anmeldefenster behandelt die Antwort wie "Format ok"; ob das Konto existiert, zeigt erst der Login (PlayFab).
+    if (isMail) return res.json({ success: true, exists: true, kind: 'mail' });
+    if (!/^[A-Za-z0-9_.\-]{3,20}$/.test(raw)) return res.json({ success: true, exists: false, kind: 'nick' });   // so ein Nick kann nicht existieren
     try {
         let exists = false;
         try {
@@ -12443,6 +12457,34 @@ app.get('/account/email-status', async (req, res) => {
         res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
     }
 });
+
+// #####################################################################
+// §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword) — NEU 25.10.2026
+//      Wer auf einem entsperrten Geraet sitzt (oder ein "Angemeldet bleiben"-Geraet hat), darf NICHT allein mit dem Ticket das Konto loeschen, die E-Mail
+//      oder das Passwort aendern. Heikle Aktionen verlangen das aktuelle Passwort; der Server prueft es bei PlayFab (Client-Login mit Benutzername oder
+//      E-Mail des Kontos; das Ergebnis muss dieselbe PlayFab-ID sein). Streng begrenzt (5 Versuche je Konto und 10 Minuten), das Passwort wird nie geloggt.
+//      Steht VOR §21; wird von /account/delete (siehe ACCOUNT_DELETE_NEEDS_PASSWORD) und spaeter von E-Mail-/Passwort-Aenderung benutzt.
+// #####################################################################
+
+async function verifyAccountPassword(playFabId, password) {
+    if (typeof password !== 'string' || password.length < 6 || password.length > 100) return { ok: false, reason: 'wrong' };
+    if (rateLimited('pwcheck|' + playFabId, 5, 600000)) return { ok: false, reason: 'limited' };
+    let info;
+    try { info = (await playfabServer('/Server/GetUserAccountInfo', { PlayFabId: playFabId })).UserInfo; }
+    catch (e) { return { ok: false, reason: 'error' }; }
+    const username = info && info.Username, email = info && info.PrivateInfo && info.PrivateInfo.Email;
+    if (!username && !email) return { ok: false, reason: 'nopassword' };
+    try {
+        const r = await axios.post(`${PLAYFAB_BASE_URL}/Client/${username ? 'LoginWithPlayFab' : 'LoginWithEmailAddress'}`,
+            username ? { TitleId: PLAYFAB_TITLE_ID, Username: username, Password: password } : { TitleId: PLAYFAB_TITLE_ID, Email: email, Password: password },
+            { headers: { 'Content-Type': 'application/json' } });
+        const got = r && r.data && r.data.data && r.data.data.PlayFabId;
+        return got === playFabId ? { ok: true } : { ok: false, reason: 'wrong' };
+    } catch (e) {
+        const st = e && e.response && e.response.status;
+        return { ok: false, reason: st === 400 || st === 401 ? 'wrong' : 'error' };
+    }
+}
 
 // #####################################################################
 // §43  NEUES PASSWORT SETZEN (POST /auth/reset-password) — NEU 25.10.2026
