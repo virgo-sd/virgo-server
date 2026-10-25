@@ -56,7 +56,7 @@
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
 //  §45  KONTO AENDERN: E-MAIL UND PASSWORT (POST /account/change-email, /account/password-link; verlangen das aktuelle Passwort); steht VOR §21
 //  §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword; Konto loeschen verlangt das Passwort, wenn ACCOUNT_DELETE_NEEDS_PASSWORD=true); steht VOR §21
-//  §43  NEUES PASSWORT SETZEN (POST /auth/reset-password: Token aus der Passwort-vergessen-Mail + neues Passwort; public, streng begrenzt); steht VOR §21
+//  (§43 NEUES PASSWORT SETZEN wurde am 25.10.2026 wieder entfernt: Reset laeuft ueber PlayFabs Standard-Seite, Entscheidung B)
 //  §42  E-MAIL-STATUS (GET /account/email-status: none/pending/verified fuer den eigenen Spieler; Client darf PlayFab dafuer nicht fragen); steht VOR §21
 //  §41  KONTO-VORPRUEFUNG (POST /auth/exists: gibt es dieses Login-Nick/diese E-Mail? nur ja/nein, streng begrenzt); steht VOR §21
 //  §40  DATEN-AUSKUNFT (GET /account/export: Kopie der eigenen Daten, DSGVO); steht VOR §21
@@ -156,7 +156,6 @@ const AUTH_POLICY = [
     ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
     ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
-    ['POST', /^\/auth\/reset-password$/,       'public'],   // NEU 25.10.2026 (§43): neues Passwort setzen per Token aus der Passwort-vergessen-Mail (streng begrenzt)
     ['POST', /^\/auth\/exists$/,               'public'],   // NEU 25.10.2026 (§41): "gibt es dieses Konto?" vor dem Login (streng begrenzt)
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
@@ -12492,12 +12491,11 @@ async function verifyAccountPassword(playFabId, password) {
 //      Beides verlangt das AKTUELLE Passwort (§44) - ein fremder Mensch an einem entsperrten oder gemerkten Geraet kommt so nicht an das Konto.
 //      E-Mail aendern: setzt die KONTAKT-Adresse ueber die Server-API; PlayFab verschickt danach (Regel "VerifyUpdatedEmail") den Bestaetigungs-Link
 //      an die NEUE Adresse; bis zur Bestaetigung gilt die neue Adresse als UNBESTAETIGT (PlayFab ersetzt die Kontakt-Adresse; Handel-Schleier kehrt bis dahin zurueck - noch nicht mit einem bestaetigten Konto getestet). Die Reset-Mail geht ohnehin an die Login-E-Mail.
-//      Passwort aendern: PlayFab hat keine "Passwort aendern"-Funktion; der einzige Weg ist der Link per E-Mail. Der Server schickt ihn (Vorlage
-//      "Password Reset") an die Login-E-Mail des Kontos; die Seite /passwort-neu.html setzt das neue Passwort (§43).
+//      Passwort aendern: PlayFab hat keine "Passwort aendern"-Funktion; der einzige Weg ist der Link per E-Mail. Der Server loest PlayFabs Standard-Reset
+//      aus (Mail an die Login-E-Mail, Link auf PlayFabs eigene Seite, 1 Stunde, einmal).
 //      Begrenzt: E-Mail aendern 5/Std. je Konto, Link 3/Std. je Konto.
 // #####################################################################
 
-const PASSWORD_RESET_TEMPLATE_ID = 'CBA99BFD1DA73133';
 const maskMail = m => { const [a, b] = String(m || '').split('@'); return a && b ? a.slice(0, 2) + '***@' + b : ''; };
 
 app.post('/account/change-email', async (req, res) => {
@@ -12528,46 +12526,14 @@ app.post('/account/password-link', async (req, res) => {
         const info = (await playfabServer('/Server/GetUserAccountInfo', { PlayFabId: caller.playFabId })).UserInfo;
         const loginMail = info && info.PrivateInfo && info.PrivateInfo.Email;
         if (!loginMail) return res.status(409).json({ success: false, noEmail: true, error: 'Zu deinem Konto gehört keine E-Mail-Adresse, an die wir einen Link schicken könnten.' });
-        await playfabServer('/Server/SendCustomAccountRecoveryEmail', { Email: loginMail, EmailTemplateId: PASSWORD_RESET_TEMPLATE_ID });
+        // PlayFabs STANDARD-Reset (ohne Vorlage): Die Mail geht an die LOGIN-E-Mail (im Spiel nicht aenderbar), der Link fuehrt auf PlayFabs eigene Seite und gilt 1 Stunde, einmal.
+        // Mit eigener Vorlage ginge sie an die KONTAKT-Adresse (aenderbar) - Entscheidung "B" vom 25.10.2026, siehe Vault "Sicherheitspruefung E-Mail und Konto".
+        await axios.post(`${PLAYFAB_BASE_URL}/Client/SendAccountRecoveryEmail`, { Email: loginMail, TitleId: PLAYFAB_TITLE_ID }, { headers: { 'Content-Type': 'application/json' } });
         res.json({ success: true, sentTo: maskMail(loginMail) });
     } catch (error) {
         const d = error && error.response && error.response.data;
         console.error('[PasswordLink] Fehler:', (d && d.error) || error.message);
         res.status(500).json({ success: false, error: 'Das hat leider nicht geklappt. Bitte versuche es später erneut.' });
-    }
-});
-
-// #####################################################################
-// §43  NEUES PASSWORT SETZEN (POST /auth/reset-password) — NEU 25.10.2026
-//      Abschluss von "Passwort vergessen": Die Mail von PlayFab (Vorlage "Password Reset") fuehrt auf die Seite /passwort-neu.html (GitHub Pages)
-//      mit ?token=...; die Seite schickt Token + neues Passwort hierher, der Server setzt es ueber PlayFab (Admin/ResetPassword braucht den
-//      Geheimschluessel, deshalb nicht im Browser). Ohne Ticket (public), streng begrenzt: je Client-IP 10 Versuche je 10 Minuten, je Token 5
-//      Versuche, insgesamt 300 je Stunde. Antwort nur ok / "Link ungueltig oder abgelaufen" (nichts ueber Konten verraten). Der Token gilt
-//      bei PlayFab einmal und nur kurz; das Passwort wird nie geloggt.
-// #####################################################################
-
-app.post('/auth/reset-password', async (req, res) => {
-    const token = String((req.body && req.body.token) || '').trim();
-    const password = String((req.body && req.body.password) || '');
-    if (!/^[A-Za-z0-9_\-]{6,200}$/.test(token)) return res.status(400).json({ success: false, error: 'Der Link ist ungültig oder abgelaufen. Bitte fordere im Spiel einen neuen an.' });
-    if (password.length < 8 || password.length > 100) return res.status(400).json({ success: false, error: 'Das Passwort muss 8 bis 100 Zeichen lang sein.' });
-    const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
-    const ip = String(req.headers['cf-connecting-ip'] || '').trim() || (xff.length > 1 ? xff[xff.length - 2] : (xff[0] || 'direkt'));
-    if (rateLimited('reset-ip|' + ip, 10, 600000) || rateLimited('reset-token|' + token, 5, 3600000) || rateLimited('reset-all', 300, 3600000))
-        return res.status(429).json({ success: false, error: 'Zu viele Versuche. Bitte warte einen Moment.' });
-    try {
-        await playfabServer('/Admin/ResetPassword', { Token: token, Password: password });
-        res.json({ success: true });
-    } catch (error) {
-        const d = error && error.response && error.response.data;
-        const st = error && error.response && error.response.status;
-        if (st === 400 && d) {
-            const code = String(d.error || d.errorMessage || '');
-            if (/InvalidPassword|PasswordTooShort|PasswordTooLong/i.test(code)) return res.status(400).json({ success: false, error: 'Das Passwort ist nicht zulässig (6 bis 100 Zeichen).' });
-            return res.status(400).json({ success: false, error: 'Der Link ist ungültig oder abgelaufen. Bitte fordere im Spiel einen neuen an.' });
-        }
-        console.error('[ResetPassword] Fehler:', error.message);
-        res.status(500).json({ success: false, error: 'Gerade nicht möglich. Bitte versuche es gleich noch einmal.' });
     }
 });
 
