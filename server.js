@@ -12376,8 +12376,10 @@ app.get('/account/export', async (req, res) => {
 // §41  KONTO-VORPRUEFUNG (POST /auth/exists) — NEU 25.10.2026
 //      Vor dem Login: "Gibt es ein Konto mit diesem Login-Nick bzw. dieser E-Mail?" (Antwort nur ja/nein) - damit das Anmeldefenster nach dem
 //      ersten Feld "gueltigen Login-Nick erkannt!" erst zeigt, wenn das Konto wirklich existiert. Ohne Ticket (public).
-//      MISSBRAUCHSSCHUTZ: Das ist eine Ausspaeh-Moeglichkeit (Namen/Adressen durchprobieren), deshalb streng begrenzt: je Client-IP 30 Abfragen
-//      je 10 Minuten (IP nur im Speicher, nie gespeichert oder geloggt), insgesamt 400 je Stunde; es wird nichts ausser ja/nein verraten.
+//      MISSBRAUCHSSCHUTZ: Das ist eine Ausspaeh-Moeglichkeit (Namen/Adressen durchprobieren), deshalb begrenzt: je Client-IP 60 Abfragen
+//      je 10 Minuten (IP nur im Speicher, nie gespeichert oder geloggt; grosszuegig, weil sich viele Spieler eine IP teilen: Familie, Schule, Handynetz),
+//      insgesamt 3000 je Stunde (reicht fuer hunderte Spieler, die sich zeitnah anmelden; ein Login = 1-2 Abfragen); es wird nichts ausser ja/nein verraten.
+//      Ist die Grenze erreicht, faellt das Anmeldefenster auf die reine Formatpruefung zurueck - das Anmelden selbst ist nie betroffen.
 //      Das Anmelden selbst verraet bei PlayFab ohnehin schon "Account nicht gefunden".
 // #####################################################################
 
@@ -12385,9 +12387,11 @@ app.post('/auth/exists', async (req, res) => {
     const raw = String((req.body && req.body.name) || '').trim();
     if (!raw || raw.length > 100 || /\s/.test(raw)) return res.status(400).json({ success: false, error: 'Ungültige Eingabe.' });
     const isMail = raw.includes('@');
+    // Client-IP hinter Render/Cloudflare: Cloudflare setzt cf-connecting-ip selbst (vom Client nicht faelschbar); sonst der vorletzte Eintrag von
+    // X-Forwarded-For (der letzte ist der Proxy selbst), notfalls der letzte
     const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
-    const ip = xff.length ? xff[xff.length - 1] : 'direkt';       // der letzte Eintrag stammt vom Render-Proxy (nicht vom Client faelschbar)
-    if (rateLimited('exists-ip|' + ip, 30, 600000) || rateLimited('exists-all', 400, 3600000))
+    const ip = String(req.headers['cf-connecting-ip'] || '').trim() || (xff.length > 1 ? xff[xff.length - 2] : (xff[0] || 'direkt'));
+    if (rateLimited('exists-ip|' + ip, 60, 600000) || rateLimited('exists-all', 3000, 3600000))
         return res.status(429).json({ success: false, error: 'Zu viele Anfragen. Bitte warte einen Moment.' });
     if (!isMail && !/^[A-Za-z0-9_.\-]{3,20}$/.test(raw)) return res.json({ success: true, exists: false, kind: 'nick' });   // so ein Nick kann nicht existieren
     try {
