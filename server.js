@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §41  KONTO-VORPRUEFUNG (POST /auth/exists: gibt es dieses Login-Nick/diese E-Mail? nur ja/nein, streng begrenzt); steht VOR §21
 //  §40  DATEN-AUSKUNFT (GET /account/export: Kopie der eigenen Daten, DSGVO); steht VOR §21
 //  §39  ANGEMELDET BLEIBEN (remember_tokens, POST /auth/remember|remembered-login|forget|forget-all; Geraete-Kennung, nur Pruefsumme gespeichert); steht VOR §21
 //  §37  TAEGLICHE AUFGABEN (daily_quest_state, GET /daily, POST /daily/claim; Katalog von Tools/Daily/sync_daily.js); steht VOR §21
@@ -151,6 +152,7 @@ const AUTH_POLICY = [
     ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
     ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
+    ['POST', /^\/auth\/exists$/,               'public'],   // NEU 25.10.2026 (§41): "gibt es dieses Konto?" vor dem Login (streng begrenzt)
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
@@ -12367,6 +12369,41 @@ app.get('/account/export', async (req, res) => {
     } catch (error) {
         console.error('[Export] Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Der Abruf ist gerade nicht möglich.' });
+    }
+});
+
+// #####################################################################
+// §41  KONTO-VORPRUEFUNG (POST /auth/exists) — NEU 25.10.2026
+//      Vor dem Login: "Gibt es ein Konto mit diesem Login-Nick bzw. dieser E-Mail?" (Antwort nur ja/nein) - damit das Anmeldefenster nach dem
+//      ersten Feld "gueltigen Login-Nick erkannt!" erst zeigt, wenn das Konto wirklich existiert. Ohne Ticket (public).
+//      MISSBRAUCHSSCHUTZ: Das ist eine Ausspaeh-Moeglichkeit (Namen/Adressen durchprobieren), deshalb streng begrenzt: je Client-IP 30 Abfragen
+//      je 10 Minuten (IP nur im Speicher, nie gespeichert oder geloggt), insgesamt 400 je Stunde; es wird nichts ausser ja/nein verraten.
+//      Das Anmelden selbst verraet bei PlayFab ohnehin schon "Account nicht gefunden".
+// #####################################################################
+
+app.post('/auth/exists', async (req, res) => {
+    const raw = String((req.body && req.body.name) || '').trim();
+    if (!raw || raw.length > 100 || /\s/.test(raw)) return res.status(400).json({ success: false, error: 'Ungültige Eingabe.' });
+    const isMail = raw.includes('@');
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    const ip = xff.length ? xff[xff.length - 1] : 'direkt';       // der letzte Eintrag stammt vom Render-Proxy (nicht vom Client faelschbar)
+    if (rateLimited('exists-ip|' + ip, 30, 600000) || rateLimited('exists-all', 400, 3600000))
+        return res.status(429).json({ success: false, error: 'Zu viele Anfragen. Bitte warte einen Moment.' });
+    if (!isMail && !/^[A-Za-z0-9_.\-]{3,20}$/.test(raw)) return res.json({ success: true, exists: false, kind: 'nick' });   // so ein Nick kann nicht existieren
+    try {
+        let exists = false;
+        try {
+            const r = await playfabServer('/Admin/GetUserAccountInfo', isMail ? { Email: raw } : { Username: raw });
+            exists = !!(r && r.UserInfo && r.UserInfo.PlayFabId);
+        } catch (e) {
+            const d = e && e.response && e.response.data;
+            if (e && e.response && e.response.status === 400 && d && /AccountNotFound/i.test(String(d.error || d.errorMessage || ''))) exists = false;
+            else throw e;
+        }
+        res.json({ success: true, exists, kind: isMail ? 'mail' : 'nick' });
+    } catch (error) {
+        console.error('[Exists] Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
     }
 });
 
