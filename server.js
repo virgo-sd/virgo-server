@@ -12525,7 +12525,7 @@ app.post('/account/password-link', async (req, res) => {
     try {
         const info = (await playfabServer('/Server/GetUserAccountInfo', { PlayFabId: caller.playFabId })).UserInfo;
         const loginMail = info && info.PrivateInfo && info.PrivateInfo.Email;
-        if (!loginMail) return res.status(409).json({ success: false, noEmail: true, error: 'Zu deinem Konto gehört keine E-Mail-Adresse, an die wir einen Link schicken könnten.' });
+        if (!loginMail) return res.status(409).json({ success: false, noEmail: true, error: 'Bei der Registrierung wurde keine E-Mail-Adresse angegeben, an die PlayFab einen Link schicken könnte. Schreib uns bitte über "Fehler melden / Support kontaktieren" - wir helfen dir.' });
         // PlayFabs STANDARD-Reset (ohne Vorlage): Die Mail geht an die LOGIN-E-Mail (im Spiel nicht aenderbar), der Link fuehrt auf PlayFabs eigene Seite und gilt 1 Stunde, einmal.
         // Mit eigener Vorlage ginge sie an die KONTAKT-Adresse (aenderbar) - Entscheidung "B" vom 25.10.2026, siehe Vault "Sicherheitspruefung E-Mail und Konto".
         await axios.post(`${PLAYFAB_BASE_URL}/Client/SendAccountRecoveryEmail`, { Email: loginMail, TitleId: PLAYFAB_TITLE_ID }, { headers: { 'Content-Type': 'application/json' } });
