@@ -12491,7 +12491,7 @@ async function verifyAccountPassword(playFabId, password) {
 // §45  KONTO AENDERN: E-MAIL UND PASSWORT (POST /account/change-email, /account/password-link) — NEU 25.10.2026
 //      Beides verlangt das AKTUELLE Passwort (§44) - ein fremder Mensch an einem entsperrten oder gemerkten Geraet kommt so nicht an das Konto.
 //      E-Mail aendern: setzt die KONTAKT-Adresse ueber die Server-API; PlayFab verschickt danach (Regel "VerifyUpdatedEmail") den Bestaetigungs-Link
-//      an die NEUE Adresse; bis zur Bestaetigung bleibt die alte bestaetigte Adresse gueltig. Die Reset-Mail geht ohnehin an die Login-E-Mail.
+//      an die NEUE Adresse; bis zur Bestaetigung gilt die neue Adresse als UNBESTAETIGT (PlayFab ersetzt die Kontakt-Adresse; Handel-Schleier kehrt bis dahin zurueck - noch nicht mit einem bestaetigten Konto getestet). Die Reset-Mail geht ohnehin an die Login-E-Mail.
 //      Passwort aendern: PlayFab hat keine "Passwort aendern"-Funktion; der einzige Weg ist der Link per E-Mail. Der Server schickt ihn (Vorlage
 //      "Password Reset") an die Login-E-Mail des Kontos; die Seite /passwort-neu.html setzt das neue Passwort (§43).
 //      Begrenzt: E-Mail aendern 5/Std. je Konto, Link 3/Std. je Konto.
