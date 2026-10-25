@@ -54,6 +54,7 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §42  E-MAIL-STATUS (GET /account/email-status: none/pending/verified fuer den eigenen Spieler; Client darf PlayFab dafuer nicht fragen); steht VOR §21
 //  §41  KONTO-VORPRUEFUNG (POST /auth/exists: gibt es dieses Login-Nick/diese E-Mail? nur ja/nein, streng begrenzt); steht VOR §21
 //  §40  DATEN-AUSKUNFT (GET /account/export: Kopie der eigenen Daten, DSGVO); steht VOR §21
 //  §39  ANGEMELDET BLEIBEN (remember_tokens, POST /auth/remember|remembered-login|forget|forget-all; Geraete-Kennung, nur Pruefsumme gespeichert); steht VOR §21
@@ -12407,6 +12408,36 @@ app.post('/auth/exists', async (req, res) => {
         res.json({ success: true, exists, kind: isMail ? 'mail' : 'nick' });
     } catch (error) {
         console.error('[Exists] Fehler:', error.message);
+        res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
+    }
+});
+
+// #####################################################################
+// §42  E-MAIL-STATUS (GET /account/email-status) — NEU 25.10.2026
+//      Der Client darf Kontakt-E-Mails NICHT selbst bei PlayFab lesen (Titel-Einstellung "Client Profile View Constraints" erlaubt es nicht:
+//      Fehler RequestViewConstraintParamsNotAllowed; bewusst so lassen - sonst koennten Clients E-Mails auslesen). Deshalb fragt der Server
+//      (Server-API) und gibt dem EIGENEN Spieler Status + Adresse zurueck: none (keine Adresse), pending (eingetragen, nicht bestaetigt), verified.
+//      emailStateOf() ist auch die Grundlage fuer spaetere serverseitige Sperren (Handel nur mit bestaetigter E-Mail).
+// #####################################################################
+
+async function emailStateOf(playFabId) {
+    const r = await playfabServer('/Server/GetPlayerProfile', { PlayFabId: playFabId, ProfileConstraints: { ShowContactEmailAddresses: true } });
+    const list = (r && r.PlayerProfile && r.PlayerProfile.ContactEmailAddresses) || [];
+    if (!list.length) return { state: 'none', email: '' };
+    const ok = list.find(e => e && e.VerificationStatus === 'Confirmed');
+    if (ok) return { state: 'verified', email: ok.EmailAddress || '' };
+    return { state: 'pending', email: (list[0] && list[0].EmailAddress) || '' };
+}
+
+app.get('/account/email-status', async (req, res) => {
+    const caller = await requireCaller(req, res);
+    if (!caller) return;
+    if (rateLimited('emailstatus|' + caller.playFabId, 60, 600000)) return res.status(429).json({ success: false, error: 'Zu viele Abfragen. Bitte warte einen Moment.' });
+    try {
+        const s = await emailStateOf(caller.playFabId);
+        res.json({ success: true, state: s.state, email: s.email });
+    } catch (error) {
+        console.error('[EmailStatus] Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
     }
 });
