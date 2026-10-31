@@ -110,7 +110,7 @@ app.use((req, res, next) => (req.path === '/admin/db-import' ? importJsonParser(
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket, X-Client-Version');
     res.header('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
@@ -154,6 +154,7 @@ const authLogThrottle    = new Map(); // logKey -> letzte Ausgabe (ms)
 const AUTH_POLICY = [
     ['*',    /^\/$/,                           'public'],   // Startseite / Render-Healthcheck
     ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
+    ['GET',  /^\/version$/,                    'public'],   // NEU 31.10.2026 (§46): Mindestversion des Clients, vor dem Login
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
     ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
     ['POST', /^\/auth\/exists$/,               'public'],   // NEU 25.10.2026 (§41): "gibt es dieses Konto?" vor dem Login (streng begrenzt)
@@ -357,6 +358,7 @@ const RATE_RULES = [
     ['POST', /^\/shop\/purchase$/,                     'shop',     60,    60000],
     ['POST', /^\/giftbox\/claim$/,                     'gift',     20,    60000],
     ['POST', /^\/market\/(create|buy|cancel)$/,        'market',   60,    60000],
+    ['POST', /^\/text\/check$/,                        'textcheck',60,   600000],
     ['POST', /^\/inventory\/use$/,                     'inv',      60,    60000],
     ['*',    /^\/(devtodos|admin\/reports|admin\/db-export|admin\/db-import)/, 'adminkey', 300, 3600000]
 ];
@@ -378,6 +380,130 @@ app.use((req, res, next) => {
     }
     next();
 });
+
+// #####################################################################
+// §46  E-MAIL-PFLICHT, CLIENT-MINDESTVERSION, TEXTPRUEFUNG (NEU 31.10.2026, "Store-reif")
+//   (a) E-Mail-Sperre: Handel (anlegen/kaufen/abbrechen), Transport an andere Spieler, Allianz gruenden (Satzung + Unterschrift) und
+//       Allianz-Rundmails verlangen eine BESTAETIGTE E-Mail-Adresse (emailStateOf, §42). Ansehen bleibt erlaubt (der Client zeigt nur
+//       Schleier/Hinweise; DIESE Sperre ist die verbindliche - Fairplay-Regel). Admin-Konten sind ausgenommen. Schalter: EMAIL_GATE=off.
+//       Zwischenspeicher: bestaetigt 10 Min., unbestaetigt 30 s (nach dem Klick auf den Link in der Mail geht es also schnell frei).
+//   (b) Client-Mindestversion: CLIENT_MIN_VERSION (Render-Variable, Standard 0 = aus). Der Client schickt X-Client-Version (ganze Zahl,
+//       ClientVersion.Current in Unity). Ist sie kleiner, antwortet der Server mit 426 + code CLIENT_OUTDATED; /version ist oeffentlich.
+//   (c) Wortfilter (Block WORTFILTER unten, erzeugt von Tools/Wortfilter/wortfilter.js): Allianz-Texte und POST /text/check (Spielernamen).
+//   (d) Support-Weiterleitung per E-Mail an die Spiel-Adresse: sendSupportEmail() (Resend-API, Render-Variablen RESEND_API_KEY + SUPPORT_MAIL_TO).
+// #####################################################################
+const WORDFILTER_MESSAGE = 'Bitte verwende keine beleidigenden oder unpassenden Begriffe.';
+
+const EMAIL_GATE_ON = (process.env.EMAIL_GATE || 'on').toLowerCase() !== 'off';
+const EMAIL_GATED = [   // [Methode, Pfad, Bezeichnung fuer die Meldung]
+    ['POST', /^\/market\/(create|buy|cancel)$/,        'den Handel'],
+    ['POST', /^\/transport\/deliver$/,                 'Transporte an andere Spieler'],
+    ['POST', /^\/alliances\/charter$/,                 'das Gründen einer Allianz'],
+    ['POST', /^\/alliances\/charter\/[0-9]+\/sign$/,   'das Gründen einer Allianz'],
+    ['POST', /^\/alliances\/[0-9]+\/broadcast-mail$/,  'Rundmails']
+];
+const emailGateCache = new Map(); // playFabId -> { verified, expires }
+const EMAIL_GATE_OK_MS = 10 * 60 * 1000, EMAIL_GATE_NO_MS = 30 * 1000;
+
+async function emailVerifiedFor(playFabId) {
+    const cached = emailGateCache.get(playFabId);
+    if (cached && cached.expires > Date.now()) return cached.verified;
+    const s = await emailStateOf(playFabId);   // wirft bei PlayFab-Fehlern -> Aufrufer meldet "gerade nicht moeglich"
+    const verified = s.state === 'verified';
+    if (emailGateCache.size > AUTH_CACHE_MAX) emailGateCache.clear();
+    emailGateCache.set(playFabId, { verified, expires: Date.now() + (verified ? EMAIL_GATE_OK_MS : EMAIL_GATE_NO_MS) });
+    return verified;
+}
+function emailGateForget(playFabId) { emailGateCache.delete(playFabId); }
+
+const CLIENT_MIN_VERSION = Math.max(0, parseInt(process.env.CLIENT_MIN_VERSION || '0', 10) || 0);
+const CLIENT_VERSION_FREE = [/^\/$/, /^\/version$/, /^\/serverTick$/, /^\/legal-texts$/, /^\/supportMessage$/, /^\/auth\//, /^\/admin\/(db-export|db-import|reports)$/, /^\/devtodos/];
+
+app.get('/version', (req, res) => res.json({ success: true, minVersion: CLIENT_MIN_VERSION }));
+
+app.use((req, res, next) => {   // (b) Mindestversion
+    if (CLIENT_MIN_VERSION <= 0 || req.method === 'OPTIONS' || CLIENT_VERSION_FREE.some(p => p.test(req.path))) return next();
+    const v = parseInt(req.get('X-Client-Version') || '0', 10) || 0;
+    if (v >= CLIENT_MIN_VERSION) return next();
+    return res.status(426).json({ success: false, code: 'CLIENT_OUTDATED', minVersion: CLIENT_MIN_VERSION,
+        error: 'Es gibt eine neue Version von VIRGO. Bitte lade die Seite neu (oder aktualisiere die App), um weiterzuspielen.' });
+});
+
+app.use(async (req, res, next) => {   // (a) E-Mail-Sperre
+    if (!EMAIL_GATE_ON || req.method === 'OPTIONS') return next();
+    const rule = EMAIL_GATED.find(r => r[0] === req.method && r[1].test(req.path));
+    if (!rule) return next();
+    try {
+        const caller = await marketIdentity(req);   // Identitaet nur aus dem geprueften Ticket
+        if (!caller) return next();                 // fehlendes Ticket meldet die Route selbst (401)
+        if (ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return next();
+        if (await emailVerifiedFor(caller.playFabId)) return next();
+        return res.status(403).json({ success: false, code: 'EMAIL_UNVERIFIED',
+            error: `Für ${rule[2]} musst du zuerst deine E-Mail-Adresse bestätigen (Optionen, E-Mail bestätigen).` });
+    } catch (error) {
+        console.error('[EmailSperre] Pruefung fehlgeschlagen:', error.message);
+        return res.status(503).json({ success: false, code: 'EMAIL_CHECK_FAILED', error: 'Die E-Mail-Prüfung ist gerade nicht möglich. Bitte versuche es gleich noch einmal.' });
+    }
+});
+
+app.post('/text/check', async (req, res) => {   // (c) Spielernamen u. ae. vor dem Speichern pruefen lassen
+    const caller = await requireCaller(req, res);
+    if (!caller) return;
+    const text = req.body && typeof req.body.text === 'string' ? req.body.text : '';
+    if (!text || text.length > 200) return res.status(400).json({ success: false, error: 'Ungültiger Text.' });
+    const hit = wordFilterHit(text);
+    res.json({ success: true, ok: !hit, message: hit ? WORDFILTER_MESSAGE : '' });
+});
+
+// (d) Support-Weiterleitung. Render sperrt auf dem Gratis-Tarif ausgehende SMTP-Ports (25/465/587), deshalb ein Mail-Dienst ueber HTTPS (Resend).
+// Ohne RESEND_API_KEY passiert nichts (nur Logzeile); die Nachricht liegt immer zusaetzlich in support_messages/Admin-Postfach.
+// Ziel: SUPPORT_MAIL_TO (Standard virgo.space.dominion@gmail.com). Absender onboarding@resend.dev (ohne eigene Domain nur an die Adresse
+// des Resend-Kontos zustellbar - genau unser Fall). Nie Spielerdaten ausser Name/ID/Text; Betreff und Text werden gekuerzt.
+async function sendSupportEmail(subject, text) {
+    const key = process.env.RESEND_API_KEY;
+    if (!key) { console.log('[Support-Mail] RESEND_API_KEY nicht gesetzt - keine E-Mail verschickt.'); return false; }
+    try {
+        await axios.post('https://api.resend.com/emails', {
+            from: process.env.SUPPORT_MAIL_FROM || 'VIRGO Support <onboarding@resend.dev>',
+            to: [process.env.SUPPORT_MAIL_TO || 'virgo.space.dominion@gmail.com'],
+            subject: String(subject).replace(/[\r\n]+/g, ' ').slice(0, 120),
+            text: String(text).slice(0, 4000)
+        }, { headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, timeout: 8000 });
+        return true;
+    } catch (error) {
+        console.error('[Support-Mail] Versand fehlgeschlagen:', error.response ? error.response.status : error.message);
+        return false;
+    }
+}
+
+// WORTFILTER-START (erzeugt von Tools/Wortfilter/wortfilter.js - NICHT von Hand aendern)
+var WF_STRONG = ["arschloch","wichser","hurensohn","hurenkind","schlampe","schwuchtel","untermensch","vergewaltig","kinderficker","kinderporno","hakenkreuz","siegheil","heilhitler","adolfhitler","judensau","nigger","niggah","faggot","motherfucker","cocksucker","bastard","fotze","orospu","yarrak","sikeyim","pimmel","wixxer","spasti","behinderter","mongoloid","kanake"];
+var WF_WORDS = ["nazi","nazis","neger","fick","ficken","fickt","ficker","hure","huren","nutte","sex","porn","porno","fuck","fucker","fucking","shit","bitch","cunt","dick","cock","pussy","anal","penis","vagina","arsch","scheiss","spast","amk","aq","hitler","isis","rape","rapist","whore","slut","retard","pedo","paedo","pisser","wixer","wichsen","schwul","tranny"];
+function wfCollapse(s) { return s.replace(/(.)\1+/g, '$1'); }
+function wfNormalize(text, oneAs) {
+    var map = { '0': 'o', '1': oneAs, '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's', '!': 'i', '|': 'i', '+': 't' };
+    var s = String(text).toLowerCase().replace(/\u00e4/g, 'ae').replace(/\u00f6/g, 'oe').replace(/\u00fc/g, 'ue').replace(/\u00df/g, 'ss');
+    return s.replace(/[013457@$!|+]/g, function (c) { return map[c]; });
+}
+// Gibt den gefundenen Begriff zurueck oder null
+function wordFilterHit(text) {
+    if (!text) return null;
+    var variants = ['i', 'l'];   // die Ziffer 1 kann i oder l bedeuten
+    for (var v = 0; v < variants.length; v++) {
+        var norm = wfNormalize(text, variants[v]);
+        var squashed = wfCollapse(norm.replace(/[^a-z]/g, ''));
+        var i;
+        for (i = 0; i < WF_STRONG.length; i++) if (squashed.indexOf(wfCollapse(WF_STRONG[i])) >= 0) return WF_STRONG[i];
+        var tokens = norm.split(/[^a-z]+/);
+        for (i = 0; i < tokens.length; i++) {
+            if (!tokens[i]) continue;
+            var t = wfCollapse(tokens[i]);
+            for (var j = 0; j < WF_WORDS.length; j++) if (t === wfCollapse(WF_WORDS[j])) return WF_WORDS[j];
+        }
+    }
+    return null;
+}
+// WORTFILTER-ENDE
 
 function adminKeyOk(provided) {
     const expected = process.env.ADMIN_KEY;
@@ -2413,6 +2539,9 @@ app.put('/alliances/:id/edit', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const { commanderId, name, tag, logoId, description, placeholder01, placeholder02, placeholder03 } = req.body;
     if (!id || !commanderId) return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
+    // NEU 31.10.2026 (§46): Wortfilter fuer alle Allianz-Texte
+    for (const text of [name, tag, description, placeholder01, placeholder02, placeholder03])
+        if (typeof text === 'string' && wordFilterHit(text)) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
 
     try {
         // UMGESTELLT (Phase R2): Name/Tag/Logo bleiben FEST an den
@@ -2960,6 +3089,9 @@ app.post('/alliances/charter', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Name oder Tag enthalten ungueltige Zeichen.' });
     const charterCaller = await requireCaller(req, res, { commanderId: founderCommanderId });
     if (!charterCaller) return;
+    // NEU 31.10.2026 (§46): Wortfilter fuer alle Allianz-Texte
+    for (const text of [name, tag, description, placeholder01, placeholder02, placeholder03])
+        if (typeof text === 'string' && wordFilterHit(text)) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
     const charterProf = await verifiedProfile(charterCaller, founderName, founderCoord);
     if (name.length < 6 || name.length > 30) return res.status(400).json({ success: false, error: 'Name muss 6-30 Zeichen haben' });
     if (tag.length < 3 || tag.length > 6) return res.status(400).json({ success: false, error: 'Tag muss 3-6 Zeichen haben' });
@@ -3695,6 +3827,9 @@ app.post('/reportBug', async (req, res) => {
     const bugCaller = await requireCaller(req, res, { commanderId: reporterCommanderId });
     if (!bugCaller) return;
     const bugProf = await verifiedProfile(bugCaller, reporterName, null);
+    // NEU 31.10.2026 (Spamschutz, Support-Plan): Mindestabstand 60 s und hoechstens 20 Berichte je Tag und Spieler
+    if (rateLimited('bugmin|' + bugCaller.playFabId, 1, 60000)) return res.status(429).json({ success: false, error: 'Bitte warte eine Minute, bevor du den nächsten Bericht sendest.' });
+    if (rateLimited('bugday|' + bugCaller.playFabId, 20, 86400000)) return res.status(429).json({ success: false, error: 'Du hast heute schon sehr viele Berichte gesendet. Bitte versuche es morgen wieder.' });
 
     try {
         const adminData = await playfabServer('/Server/GetUserData', {
@@ -3731,6 +3866,7 @@ app.post('/reportBug', async (req, res) => {
             Permission: 'Private'
         });
 
+        sendSupportEmail(`[VIRGO Fehlerbericht] ${bugProf.name} (#${bugCaller.commanderId})`, body);   // §46 (d), schlaegt still fehl
         res.json({ success: true });
     } catch (error) {
         console.error('[Server] reportBug Fehler:', error.message);
@@ -3963,13 +4099,28 @@ app.post('/supportMessage', async (req, res) => {
     if (message.length > 2000)
         return res.status(400).json({ success: false, error: 'Nachricht zu lang (max. 2000 Zeichen).' });
 
+    // NEU 31.10.2026 (Spamschutz, Support-Plan): angemeldet (Ticket) je Spieler 3/Std., 10/Tag, Abstand 60 s; ohne Login gilt nur die
+    // gemeinsame Grenze (RATE_RULES 'support') plus Notbremse 200 Nachrichten/Tag insgesamt; identischer Text innerhalb von 24 Std. wird abgelehnt.
+    const supportCaller = req.get('X-Session-Ticket') ? await marketIdentity(req).catch(() => null) : null;
+    if (supportCaller) {
+        const k = supportCaller.playFabId;
+        if (rateLimited('supmin|' + k, 1, 60000)) return res.status(429).json({ success: false, error: 'Bitte warte eine Minute, bevor du die nächste Nachricht sendest.' });
+        if (rateLimited('suphour|' + k, 3, 3600000)) return res.status(429).json({ success: false, error: 'Du hast gerade mehrere Nachrichten gesendet. Bitte versuche es in einer Stunde wieder.' });
+        if (rateLimited('supday|' + k, 10, 86400000)) return res.status(429).json({ success: false, error: 'Du hast heute schon viele Nachrichten gesendet. Bitte versuche es morgen wieder.' });
+    }
+    if (rateLimited('supall', 200, 86400000)) return res.status(429).json({ success: false, error: 'Der Support ist gerade überlastet. Bitte versuche es später wieder.' });
+
     try {
+        const dup = await pool.query(`SELECT 1 FROM support_messages WHERE message = $1 AND created_at > now() - interval '24 hours' LIMIT 1`, [message.trim()]);
+        if (dup.rows.length > 0) return res.status(409).json({ success: false, error: 'Diese Nachricht haben wir schon erhalten. Danke!' });
         const result = await pool.query(
             `INSERT INTO support_messages (sender_commander_id, sender_name, message)
              VALUES ($1, $2, $3) RETURNING *`,
             [parseInt(senderCommanderId, 10) || null, senderName ? cleanDisplayName(senderName) : null, message.trim()]
         );
-        res.json({ success: true, supportMessage: result.rows[0] });
+        const row = result.rows[0];
+        sendSupportEmail(`[VIRGO Support] ${row.sender_name || 'unbekannt'}${row.sender_commander_id ? ' (#' + row.sender_commander_id + ')' : ' (ohne Login)'}`, message.trim());   // §46 (d), schlaegt still fehl
+        res.json({ success: true, supportMessage: row });
     } catch (error) {
         console.error('[Server] supportMessage POST Fehler:', error.message);
         res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
@@ -5520,10 +5671,10 @@ const ECON_SHIP_BUILD_MINUTES = {"warship":{"0":300,"1":360,"2":420,"3":1800},"s
 const ECON_MAX_BUILDING_LEVEL = 18;
 const ECON_BUILDING_COSTS = {   // Baukosten je Gebaeude-Index, Zeile = Zielstufe 1..18, Spalte = Ress01-05
     0: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[3532800,7065600,28262400,14131200,141312],[4062720,8125440,32501760,16250880,162509],[4672128,9344256,37377024,18688512,186885]],
-    1: [[0,25,200,150,1],[0,50,400,300,2],[0,100,800,600,4],[0,300,2400,1800,12],[0,600,4800,3600,24],[0,1200,9600,7200,48],[0,2400,19200,14400,96],[0,4800,38400,28800,192],[0,24000,192000,144000,960],[0,48000,384000,288000,1920],[0,96000,768000,576000,3840],[0,192000,1536000,1152000,7680],[0,384000,3072000,2304000,15360],[0,3072000,24576000,18432000,122880],[0,6144000,49152000,36864000,245760],[0,7065600,56524800,42393600,282624],[0,8125440,65003520,48752640,325018],[0,9344256,74754048,56065536,373770]],
-    2: [[50,0,175,50,1],[100,0,350,100,2],[200,0,700,200,4],[600,0,2100,600,12],[1200,0,4200,1200,24],[2400,0,8400,2400,48],[4800,0,16800,4800,96],[9600,0,33600,9600,192],[48000,0,168000,48000,960],[96000,0,336000,96000,1920],[192000,0,672000,192000,3840],[384000,0,1344000,384000,7680],[768000,0,2688000,768000,15360],[6144000,0,21504000,6144000,122880],[12288000,0,43008000,12288000,245760],[14131200,0,49459200,14131200,282624],[16250880,0,56878080,16250880,325018],[18688512,0,65409792,18688512,373770]],
-    3: [[125,50,250,125,2],[250,100,500,250,4],[500,200,1000,500,8],[1500,600,3000,1500,24],[3000,1200,6000,3000,48],[6000,2400,12000,6000,96],[12000,4800,24000,12000,192],[24000,9600,48000,24000,384],[120000,48000,240000,120000,1920],[240000,96000,480000,240000,3840],[480000,192000,960000,480000,7680],[960000,384000,1920000,960000,15360],[1920000,768000,3840000,1920000,30720],[15360000,6144000,30720000,15360000,245760],[30720000,12288000,61440000,30720000,491520],[35328000,14131200,70656000,35328000,565248],[40627200,16250880,81254400,40627200,650035],[46721280,18688512,93442560,46721280,747540]],
-    4: [[150,75,250,250,2],[300,150,500,500,4],[600,300,1000,1000,8],[1800,900,3000,3000,24],[3600,1800,6000,6000,48],[7200,3600,12000,12000,96],[14400,7200,24000,24000,192],[28800,14400,48000,48000,384],[144000,72000,240000,240000,1920],[288000,144000,480000,480000,3840],[576000,288000,960000,960000,7680],[1152000,576000,1920000,1920000,15360],[2304000,1152000,3840000,3840000,30720],[18432000,9216000,30720000,30720000,245760],[36864000,18432000,61440000,61440000,491520],[42393600,21196800,70656000,70656000,565248],[48752640,24376320,81254400,81254400,650035],[56065536,28032768,93442560,93442560,747540]],
+    1: [[0,25,100,75,1],[0,50,200,150,2],[0,100,400,300,4],[0,300,1200,900,12],[0,600,4800,3600,24],[0,1200,9600,7200,48],[0,2400,19200,14400,96],[0,4800,38400,28800,192],[0,24000,192000,144000,960],[0,48000,384000,288000,1920],[0,96000,768000,576000,3840],[0,192000,1536000,1152000,7680],[0,384000,3072000,2304000,15360],[0,3072000,24576000,18432000,122880],[0,6144000,49152000,36864000,245760],[0,7065600,56524800,42393600,282624],[0,8125440,65003520,48752640,325018],[0,9344256,74754048,56065536,373770]],
+    2: [[50,0,88,25,1],[100,0,175,50,2],[200,0,350,100,4],[600,0,1050,300,12],[1200,0,4200,1200,24],[2400,0,8400,2400,48],[4800,0,16800,4800,96],[9600,0,33600,9600,192],[48000,0,168000,48000,960],[96000,0,336000,96000,1920],[192000,0,672000,192000,3840],[384000,0,1344000,384000,7680],[768000,0,2688000,768000,15360],[6144000,0,21504000,6144000,122880],[12288000,0,43008000,12288000,245760],[14131200,0,49459200,14131200,282624],[16250880,0,56878080,16250880,325018],[18688512,0,65409792,18688512,373770]],
+    3: [[125,50,125,62,2],[250,100,250,125,4],[500,200,500,250,8],[1500,600,1500,750,24],[3000,1200,6000,3000,48],[6000,2400,12000,6000,96],[12000,4800,24000,12000,192],[24000,9600,48000,24000,384],[120000,48000,240000,120000,1920],[240000,96000,480000,240000,3840],[480000,192000,960000,480000,7680],[960000,384000,1920000,960000,15360],[1920000,768000,3840000,1920000,30720],[15360000,6144000,30720000,15360000,245760],[30720000,12288000,61440000,30720000,491520],[35328000,14131200,70656000,35328000,565248],[40627200,16250880,81254400,40627200,650035],[46721280,18688512,93442560,46721280,747540]],
+    4: [[150,75,125,125,2],[300,150,250,250,4],[600,300,500,500,8],[1800,900,1500,1500,24],[3600,1800,6000,6000,48],[7200,3600,12000,12000,96],[14400,7200,24000,24000,192],[28800,14400,48000,48000,384],[144000,72000,240000,240000,1920],[288000,144000,480000,480000,3840],[576000,288000,960000,960000,7680],[1152000,576000,1920000,1920000,15360],[2304000,1152000,3840000,3840000,30720],[18432000,9216000,30720000,30720000,245760],[36864000,18432000,61440000,61440000,491520],[42393600,21196800,70656000,70656000,565248],[48752640,24376320,81254400,81254400,650035],[56065536,28032768,93442560,93442560,747540]],
     5: [[2500,2500,5000,4000,240],[5000,5000,10000,8000,480],[10000,10000,20000,16000,960],[30000,30000,60000,48000,2880],[60000,60000,120000,96000,5760],[120000,120000,240000,192000,11520],[240000,240000,480000,384000,23040],[480000,480000,960000,768000,46080],[2400000,2400000,4800000,3840000,230400],[4800000,4800000,9600000,7680000,460800],[9600000,9600000,19200000,15360000,921600],[19200000,19200000,38400000,30720000,1843200],[38400000,38400000,76800000,61440000,3686400],[307200000,307200000,614400000,491520000,29491200],[614400000,614400000,1228800000,983040000,58982400],[706560000,706560000,1413120000,1130496000,67829760],[812544000,812544000,1625088000,1300070400,78004224],[934425600,934425600,1868851200,1495080960,89704858]],
     6: [[25,50,200,100,1],[25,50,200,100,1],[50,100,400,200,2],[100,200,800,400,4],[300,600,2400,1200,12],[600,1200,4800,2400,24],[1200,2400,9600,4800,48],[2400,4800,19200,9600,96],[4800,9600,38400,19200,192],[24000,48000,192000,96000,960],[48000,96000,384000,192000,1920],[96000,192000,768000,384000,3840],[192000,384000,1536000,768000,7680],[384000,768000,3072000,1536000,15360],[3072000,6144000,24576000,12288000,122880],[3532800,7065600,28262400,14131200,141312],[4062720,8125440,32501760,16250880,162509],[4672128,9344256,37377024,18688512,186885]],
     10: [[9999,9999,9999,9999,9999],[9999,9999,9999,9999,9999],[19998,19998,19998,19998,19998],[39996,39996,39996,39996,39996],[119988,119988,119988,119988,119988],[239976,239976,239976,239976,239976],[479952,479952,479952,479952,479952],[959904,959904,959904,959904,959904],[1919808,1919808,1919808,1919808,1919808],[9599040,9599040,9599040,9599040,9599040],[19198080,19198080,19198080,19198080,19198080],[38396160,38396160,38396160,38396160,38396160],[76792320,76792320,76792320,76792320,76792320],[153584640,153584640,153584640,153584640,153584640],[1228677120,1228677120,1228677120,1228677120,1228677120],[1412978688,1412978688,1412978688,1412978688,1412978688],[1624925491,1624925491,1624925491,1624925491,1624925491],[1868664315,1868664315,1868664315,1868664315,1868664315]],
@@ -12516,6 +12667,7 @@ app.post('/account/change-email', async (req, res) => {
     if (!pw.ok) return res.status(403).json({ success: false, needPassword: true, error: pw.reason === 'limited' ? 'Zu viele Versuche. Bitte warte ein paar Minuten.' : pw.reason === 'error' ? 'Die Prüfung ist gerade nicht möglich. Bitte versuche es später erneut.' : 'Das Passwort stimmt nicht.' });
     try {
         await playfabServer('/Server/AddOrUpdateContactEmail', { PlayFabId: caller.playFabId, EmailAddress: email });
+        emailGateForget(caller.playFabId);   // §46: neue Adresse = wieder unbestaetigt, Zwischenspeicher der E-Mail-Sperre leeren
         res.json({ success: true });
     } catch (error) {
         const d = error && error.response && error.response.data;
