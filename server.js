@@ -161,6 +161,7 @@ const AUTH_POLICY = [
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
+    ['*',    /^\/admin\/support(\/.*)?$/,      'keyed'],    // NEU 31.10.2026 (§47): eigener ADMIN_KEY (Header X-Admin-Key)
     ['GET',  /^\/admin\/db-export$/,           'keyed'],    // eigener ADMIN_KEY (+ DB_EXPORT_ENABLED)
     ['POST', /^\/admin\/db-import$/,           'keyed'],    // eigener ADMIN_KEY (+ DB_IMPORT_ENABLED)
     ['POST', /^\/admin\/giveAccountResource$/, 'admin'],
@@ -417,7 +418,7 @@ async function emailVerifiedFor(playFabId) {
 function emailGateForget(playFabId) { emailGateCache.delete(playFabId); }
 
 const CLIENT_MIN_VERSION = Math.max(0, parseInt(process.env.CLIENT_MIN_VERSION || '0', 10) || 0);
-const CLIENT_VERSION_FREE = [/^\/$/, /^\/version$/, /^\/serverTick$/, /^\/legal-texts$/, /^\/supportMessage$/, /^\/auth\//, /^\/admin\/(db-export|db-import|reports)$/, /^\/devtodos/];
+const CLIENT_VERSION_FREE = [/^\/$/, /^\/version$/, /^\/serverTick$/, /^\/legal-texts$/, /^\/supportMessage$/, /^\/auth\//, /^\/admin\/(db-export|db-import|reports)$/, /^\/admin\/support/, /^\/devtodos/];
 
 app.get('/version', (req, res) => res.json({ success: true, minVersion: CLIENT_MIN_VERSION }));
 
@@ -958,6 +959,11 @@ async function initDatabase() {
             );
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_messages_created_at ON support_messages (created_at DESC);`);
+        // NEU 31.10.2026 (§47): Status (new/read/done) und Antwort je Nachricht
+        await pool.query(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new';`);
+        await pool.query(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS reply TEXT;`);
+        await pool.query(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ;`);
+        await pool.query(`UPDATE support_messages SET status = 'read' WHERE is_read = true AND status = 'new';`);
 
         // -------------------------------------------------------
         // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
@@ -3961,6 +3967,7 @@ app.post('/report-player', async (req, res) => {
     } catch (error) {
         console.error('[Server] report-player Fehler (Admin-Mail, Meldung aber gespeichert):', error.message);
     }
+    sendSupportEmail(`[VIRGO Spielermeldung] Commander #${reportedId} (${reason})`, `Gemeldet von Commander #${reporterId}\nGrund: ${reason}\n\n${message || '(kein Text)'}`);   // §46 (d), schlaegt still fehl
 
     res.json({ success: true });
 });
@@ -4144,6 +4151,92 @@ app.get('/supportMessages', async (req, res) => {
         res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
     }
 });
+
+// #####################################################################
+// §47  SUPPORT-POSTFACH Stufe 1+2 (31.10.2026, Plan "Support-Postfach")
+//      Nur mit ADMIN_KEY (Header X-Admin-Key, alternativ ?key=) - gedacht fuer das Betriebswerkzeug (support-lesen / support-status / support-antworten).
+//      Status je Nachricht: new -> read -> done. Antwort = Ingame-Mail (Absender "Support") an die Commander-ID des Absenders;
+//      ohne Login gesendete Nachrichten (Commander-ID leer) koennen NICHT beantwortet werden (keine Adresse gespeichert, Datenschutz).
+// #####################################################################
+// SUPPORT47-START
+const SUPPORT_STATUSES = ['new', 'read', 'done'];
+const SUPPORT_REPLY_MAX = 1500;
+
+function supportKeyOk(req) { return adminKeyOk(req.get('X-Admin-Key') || req.query.key); }
+
+// Ingame-Mail "Support" in das Postfach eines Spielers legen. Wirft bei Fehlern (der Aufrufer meldet sie), im Gegensatz zu stationedMailTo.
+async function supportMailTo(commanderId, subject, body) {
+    const info = await stationedLookupCommander(commanderId);
+    if (!info) throw new Error('Commander nicht gefunden');
+    const commander = await stationedLoadCommanderData(info.playFabId);
+    if (!commander) throw new Error('Keine Spielerdaten');
+    const mailSeq = await getNextMailSeq();
+    pushInbox(commander, {
+        mailId: `M-${commander.commanderId}-${mailSeq}`,
+        category: 0, // System
+        subject, body,
+        senderName: 'Support', // LOCALIZE
+        senderId: 0,
+        isRead: false,
+        isFavorite: false,
+        timestamp: formatTimestamp(new Date()),
+        reportId: ''
+    });
+    await stationedSaveCommanderData(info.playFabId, commander);
+}
+
+app.get('/admin/support', async (req, res) => {
+    if (!supportKeyOk(req)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    try {
+        const st = String(req.query.status || 'open');
+        const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+        const where = st === 'all' ? '' : st === 'open' ? `WHERE status IN ('new','read')` : SUPPORT_STATUSES.includes(st) ? `WHERE status = '${st}'` : null;
+        if (where === null) return res.status(400).json({ success: false, error: 'status: open | new | read | done | all' });
+        const msgs = await pool.query(`SELECT id, sender_commander_id, sender_name, message, status, reply, replied_at, created_at FROM support_messages ${where} ORDER BY created_at ASC LIMIT $1`, [limit]);
+        const reports = await pool.query('SELECT id, reporter_commander_id, reported_commander_id, reason, message, created_at FROM player_reports ORDER BY id DESC LIMIT 30');
+        res.json({ success: true, supportMessages: msgs.rows, playerReports: reports.rows });
+    } catch (e) {
+        console.error('[Server] admin/support GET Fehler:', e.message);
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
+    }
+});
+
+app.post('/admin/support/status', async (req, res) => {
+    if (!supportKeyOk(req)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    const id = parseInt(req.body && req.body.id, 10), status = req.body && req.body.status;
+    if (!id || !SUPPORT_STATUSES.includes(status)) return res.status(400).json({ success: false, error: 'id und status (new|read|done) erforderlich' });
+    try {
+        const r = await pool.query('UPDATE support_messages SET status = $2, is_read = $3 WHERE id = $1', [id, status, status !== 'new']);
+        if (r.rowCount === 0) return res.status(404).json({ success: false, error: 'Nachricht nicht gefunden' });
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[Server] admin/support/status Fehler:', e.message);
+        res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
+    }
+});
+
+app.post('/admin/support/reply', async (req, res) => {
+    if (!supportKeyOk(req)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    const id = parseInt(req.body && req.body.id, 10);
+    const text = String((req.body && req.body.text) || '').trim();
+    if (!id || !text) return res.status(400).json({ success: false, error: 'id und text erforderlich' });
+    if (text.length > SUPPORT_REPLY_MAX) return res.status(400).json({ success: false, error: `Antwort zu lang (max. ${SUPPORT_REPLY_MAX} Zeichen)` });
+    try {
+        const r = await pool.query('SELECT id, sender_commander_id, message, status FROM support_messages WHERE id = $1', [id]);
+        if (r.rows.length === 0) return res.status(404).json({ success: false, error: 'Nachricht nicht gefunden' });
+        const row = r.rows[0];
+        if (!row.sender_commander_id) return res.status(400).json({ success: false, error: 'Absender war nicht angemeldet - keine Antwort möglich' });
+        if (row.status === 'done') return res.status(409).json({ success: false, error: 'Schon beantwortet/erledigt' });
+        const quote = row.message.length > 200 ? row.message.slice(0, 200) + ' ...' : row.message;
+        await supportMailTo(row.sender_commander_id, 'Antwort vom VIRGO-Support', `${text}\n\n---\nDeine Nachricht:\n${quote}`);
+        await pool.query(`UPDATE support_messages SET status = 'done', is_read = true, reply = $2, replied_at = now() WHERE id = $1`, [id, text]);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[Server] admin/support/reply Fehler:', e.message);
+        res.status(500).json({ success: false, error: 'Zustellung fehlgeschlagen: ' + e.message });
+    }
+});
+// SUPPORT47-ENDE
 
 // #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
