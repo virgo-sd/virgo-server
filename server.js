@@ -4498,6 +4498,10 @@ app.post('/admin/db-import', async (req, res) => {
     const dump = req.body;
     if (!dump || typeof dump.tables !== 'object') return res.status(400).json({ success: false, error: 'Keine Sicherung im Body.' });
     const result = {};
+    // NEU 31.10.2026: &replace=planet_registry,npc_clans,npc_bases ueberschreibt Zeilen mit gleichem Schluessel (vorher geloescht), statt sie zu uebergehen.
+    // Noetig, weil der Serverstart diese Tabellen vor dem Import mit Standardwerten befuellt (Piraten-Staerke/Uebernahmen, Piraten-Aussenposten im Register).
+    const REPLACE_KEYS = { planet_registry: 'coord', npc_clans: 'sector_id', npc_bases: 'coord' };
+    const replaceTables = typeof req.query.replace === 'string' ? req.query.replace.split(',').filter(t => REPLACE_KEYS[t]) : [];
     try {
         for (const name of DB_EXPORT_TABLES) {            // feste Reihenfolge = Fremdschluessel-Reihenfolge
             const rows = dump.tables[name];
@@ -4507,6 +4511,10 @@ app.post('/admin/db-import', async (req, res) => {
                 const cols = Object.keys(row);
                 if (cols.length === 0 || !cols.every(c => /^[a-z_][a-z0-9_]*$/.test(c))) { failed++; continue; }
                 const values = cols.map(c => (row[c] !== null && typeof row[c] === 'object') ? JSON.stringify(row[c]) : row[c]);
+                if (replaceTables.includes(name) && row[REPLACE_KEYS[name]] !== undefined) {
+                    try { await pool.query('DELETE FROM ' + name + ' WHERE ' + REPLACE_KEYS[name] + ' = $1', [row[REPLACE_KEYS[name]]]); }
+                    catch (e) { failed++; console.error('[Import] replace ' + name + ':', e.message); continue; }
+                }
                 try {
                     const r = await pool.query(
                         'INSERT INTO ' + name + ' (' + cols.join(', ') + ') VALUES (' + cols.map((c, i) => '$' + (i + 1)).join(', ') + ') ON CONFLICT DO NOTHING',
