@@ -964,6 +964,15 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS reply TEXT;`);
         await pool.query(`ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ;`);
         await pool.query(`UPDATE support_messages SET status = 'read' WHERE is_read = true AND status = 'new';`);
+        // NEU 31.10.2026 (§48): Live-Support-Gespraeche (Aufbewahrung 30 Tage, Loeschung bei Kontoloeschung)
+        await pool.query(`CREATE TABLE IF NOT EXISTS support_chats (
+            id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, pfid TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'waiting', admin_commander_id INTEGER, closed_by TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(), started_at TIMESTAMPTZ, closed_at TIMESTAMPTZ, last_msg_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS support_chat_messages (
+            id SERIAL PRIMARY KEY, chat_id INTEGER NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chats_commander ON support_chats (commander_id, status);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chat_messages_chat ON support_chat_messages (chat_id, id);`);
 
         // -------------------------------------------------------
         // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
@@ -4239,6 +4248,191 @@ app.post('/admin/support/reply', async (req, res) => {
 // SUPPORT47-ENDE
 
 // #####################################################################
+// §48  LIVE-SUPPORT IM SPIEL (31.10.2026, Konzept "Live-Support im Spiel")
+//      Ein Admin schaltet "Support-Bereitschaft" ein (Heartbeat alle 60 s, gilt 2 Min.); solange mindestens einer bereit ist, sehen Spieler
+//      "Support ansprechen". Anfrage -> Warteschlange -> ein Admin uebernimmt ("claim") -> eigener Chat -> Beenden -> Protokoll per E-Mail
+//      (sendSupportEmail) und Ingame-Mail an den Admin. Vorgaben (Empfehlungen, vom Nutzer noch nicht bestaetigt, per Konstante aenderbar):
+//      nur mit bestaetigter E-Mail, nur Admin-Konten (ADMIN_COMMANDER_IDS), Aufbewahrung 30 Tage, Auto-Ende nach 15 Min. ohne Nachricht.
+//      Personendaten: Gespraeche werden bei Kontoloeschung geloescht und stehen in der Daten-Auskunft.
+// #####################################################################
+// SUPPORT48-START
+const LIVE_SUPPORT_VERIFIED_ONLY = true;           // Frage 2 des Konzepts: nur mit bestaetigter E-Mail
+const LIVE_SUPPORT_PRESENCE_MS   = 2 * 60 * 1000;  // Admin gilt so lange als bereit
+const LIVE_SUPPORT_IDLE_MS       = 15 * 60 * 1000; // Auto-Ende (aktives Gespraech ohne Nachricht)
+const LIVE_SUPPORT_WAIT_MS       = 30 * 60 * 1000; // Anfrage ohne Admin verfaellt
+const LIVE_SUPPORT_KEEP_DAYS     = 30;             // Frage 3: Aufbewahrung beendeter Gespraeche
+const LIVE_SUPPORT_MAX_TEXT      = 300;
+const liveSupportPresence = new Map();             // adminCommanderId -> letzter Heartbeat (ms)
+let liveSupportLastCleanup = 0;
+
+function liveSupportIsAdmin(caller) { return !!caller && ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId)); }
+function liveSupportOnline() {
+    const now = Date.now();
+    for (const [id, t] of liveSupportPresence) { if (now - t > LIVE_SUPPORT_PRESENCE_MS) liveSupportPresence.delete(id); }
+    return liveSupportPresence.size > 0;
+}
+function liveSupportBerlin(d) { return new Date(d).toLocaleString('de-DE', { timeZone: 'Europe/Berlin' }); }
+
+// Protokoll als Text (Verlauf mit Uhrzeiten, Name + Commander-ID, Thema, Dauer)
+function liveSupportProtocol(chat, msgs, closedBy) {
+    const start = new Date(chat.started_at || chat.created_at), end = new Date(chat.closed_at || Date.now());
+    const mins = Math.max(0, Math.round((end - start) / 60000));
+    const lines = msgs.map(m => `[${new Date(m.created_at).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', second: '2-digit' })}] ${m.sender === 'admin' ? 'Support' : chat.name}: ${m.text}`);
+    return `Live-Support-Gespräch #${chat.id}\nSpieler: ${chat.name} (Commander #${chat.commander_id})\nThema: ${chat.topic}\nBeginn: ${liveSupportBerlin(start)}\nDauer: ${mins} Min.\nBeendet von: ${closedBy}\nBearbeiter: ${chat.admin_commander_id ? 'Commander #' + chat.admin_commander_id : '-'}\n\n` + (lines.length ? lines.join('\n') : '(keine Nachrichten)');
+}
+
+// Beendet ein Gespraech (nur wenn noch offen) und verschickt das Protokoll. Gibt die Zeile zurueck oder null, wenn es schon beendet war.
+async function liveSupportClose(chatId, closedBy) {
+    const r = await pool.query(`UPDATE support_chats SET status = 'closed', closed_at = now(), closed_by = $2 WHERE id = $1 AND status <> 'closed' RETURNING *`, [chatId, closedBy]);
+    if (r.rows.length === 0) return null;
+    const chat = r.rows[0];
+    try {
+        const ms = await pool.query('SELECT sender, text, created_at FROM support_chat_messages WHERE chat_id = $1 ORDER BY id ASC', [chatId]);
+        const protocol = liveSupportProtocol(chat, ms.rows, closedBy);
+        sendSupportEmail(`[VIRGO Live-Support] ${chat.name} (#${chat.commander_id})`, protocol);   // schlaegt still fehl
+        const adminId = chat.admin_commander_id || ADMIN_COMMANDER_IDS[0];   // nie uebernommene Anfrage (Zeitablauf): Protokoll an den ersten Admin
+        if (adminId) await supportMailTo(adminId, `Live-Support-Protokoll: ${chat.name} (#${chat.commander_id})`, protocol);
+    } catch (e) { console.error('[LiveSupport] Protokoll-Zustellung:', e.message); }
+    return chat;
+}
+
+// Alte/verwaiste Gespraeche aufraeumen (laeuft bei jeder Anfrage, sehr billig; Loeschung hoechstens stuendlich)
+async function liveSupportMaintain() {
+    const idle = await pool.query(`SELECT id FROM support_chats WHERE (status = 'active' AND last_msg_at < now() - $1::interval) OR (status = 'waiting' AND created_at < now() - $2::interval)`,
+        [`${LIVE_SUPPORT_IDLE_MS / 1000} seconds`, `${LIVE_SUPPORT_WAIT_MS / 1000} seconds`]);
+    for (const row of idle.rows) await liveSupportClose(row.id, 'automatisch (Zeitablauf)');
+    if (Date.now() - liveSupportLastCleanup > 3600000) {
+        liveSupportLastCleanup = Date.now();
+        await pool.query(`DELETE FROM support_chat_messages WHERE chat_id IN (SELECT id FROM support_chats WHERE status = 'closed' AND closed_at < now() - $1::interval)`, [`${LIVE_SUPPORT_KEEP_DAYS} days`]);
+        await pool.query(`DELETE FROM support_chats WHERE status = 'closed' AND closed_at < now() - $1::interval`, [`${LIVE_SUPPORT_KEEP_DAYS} days`]);
+    }
+}
+
+// Gemeinsamer Anfang aller Wege: Identitaet aus dem Ticket + Pflege
+async function liveSupportStart(req, res) {
+    const caller = await requireCaller(req, res);
+    if (!caller) return null;
+    try { await liveSupportMaintain(); } catch (e) { console.error('[LiveSupport] Pflege:', e.message); }
+    return caller;
+}
+function liveSupportPublic(c) {
+    return { id: c.id, name: c.name, topic: c.topic, status: c.status, commanderId: c.commander_id, adminCommanderId: c.admin_commander_id || 0, createdAt: c.created_at, startedAt: c.started_at, closedAt: c.closed_at };
+}
+// Darf dieser Aufrufer in diesem Gespraech lesen/schreiben? Spieler: nur das eigene; Admin: nur offene Gespraeche (lesen) bzw. das uebernommene (schreiben)
+function liveSupportMayRead(caller, chat) { return liveSupportIsAdmin(caller) || Number(chat.commander_id) === Number(caller.commanderId); }
+
+app.get('/support/live/status', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    try {
+        const out = { success: true, online: liveSupportOnline(), isAdmin: liveSupportIsAdmin(caller) };
+        const mine = await pool.query(`SELECT * FROM support_chats WHERE commander_id = $1 AND status <> 'closed' ORDER BY id DESC LIMIT 1`, [caller.commanderId]);
+        out.myChat = mine.rows.length ? liveSupportPublic(mine.rows[0]) : null;
+        if (out.isAdmin) {
+            const w = await pool.query(`SELECT status, COUNT(*)::int AS n FROM support_chats WHERE status <> 'closed' GROUP BY status`);
+            out.waiting = (w.rows.find(r => r.status === 'waiting') || { n: 0 }).n;
+            out.active  = (w.rows.find(r => r.status === 'active') || { n: 0 }).n;
+            out.ready   = liveSupportPresence.has(Number(caller.commanderId));
+        }
+        res.json(out);
+    } catch (e) { console.error('[LiveSupport] status:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/live/presence', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    if (!liveSupportIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    if (req.body && req.body.on === false) liveSupportPresence.delete(Number(caller.commanderId));
+    else liveSupportPresence.set(Number(caller.commanderId), Date.now());
+    res.json({ success: true, ready: liveSupportPresence.has(Number(caller.commanderId)) });
+});
+
+app.post('/support/live/request', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    const topic = String((req.body && req.body.topic) || '').trim().slice(0, LIVE_SUPPORT_MAX_TEXT);
+    if (!topic) return res.status(400).json({ success: false, error: 'Bitte beschreibe kurz, worum es geht.' });
+    if (!liveSupportOnline()) return res.status(409).json({ success: false, code: 'SUPPORT_OFFLINE', error: 'Gerade ist niemand vom Support erreichbar. Bitte nutze das Support-Formular.' });
+    if (wordFilterHit(topic)) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
+    try {
+        if (LIVE_SUPPORT_VERIFIED_ONLY && !liveSupportIsAdmin(caller) && EMAIL_GATE_ON && !(await emailVerifiedFor(caller.playFabId)))
+            return res.status(403).json({ success: false, code: 'EMAIL_UNVERIFIED', error: 'Für den Live-Support brauchst du eine bestätigte E-Mail-Adresse. Bis dahin hilft dir das Support-Formular.' });
+        const open = await pool.query(`SELECT id FROM support_chats WHERE commander_id = $1 AND status <> 'closed' LIMIT 1`, [caller.commanderId]);
+        if (open.rows.length) return res.status(409).json({ success: false, error: 'Du hast schon eine offene Anfrage.' });
+        if (rateLimited('livereqgap|' + caller.playFabId, 1, 120000)) return res.status(429).json({ success: false, error: 'Bitte warte ein paar Minuten, bevor du eine neue Anfrage stellst.' });
+        if (rateLimited('livereqday|' + caller.playFabId, 5, 86400000)) return res.status(429).json({ success: false, error: 'Du hast heute schon mehrere Anfragen gestellt. Bitte versuche es morgen wieder.' });
+        const prof = await verifiedProfile(caller, req.body && req.body.name, null);
+        const r = await pool.query(`INSERT INTO support_chats (commander_id, pfid, name, topic, status) VALUES ($1, $2, $3, $4, 'waiting') RETURNING *`, [caller.commanderId, caller.playFabId, prof.name, topic]);
+        const ahead = await pool.query(`SELECT COUNT(*)::int AS n FROM support_chats WHERE status = 'waiting' AND id < $1`, [r.rows[0].id]);
+        res.json({ success: true, chat: liveSupportPublic(r.rows[0]), position: ahead.rows[0].n + 1 });
+    } catch (e) { console.error('[LiveSupport] request:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.get('/support/live/list', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    if (!liveSupportIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    try {
+        const r = await pool.query(`SELECT * FROM support_chats WHERE status <> 'closed' ORDER BY (status = 'waiting') DESC, created_at ASC LIMIT 50`);
+        res.json({ success: true, chats: r.rows.map(liveSupportPublic) });
+    } catch (e) { console.error('[LiveSupport] list:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.get('/support/live/:id', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10), since = parseInt(req.query.since, 10) || 0;
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        const c = await pool.query('SELECT * FROM support_chats WHERE id = $1', [id]);
+        if (!c.rows.length || !liveSupportMayRead(caller, c.rows[0])) return res.status(404).json({ success: false, error: 'Gespräch nicht gefunden.' });
+        const ms = await pool.query('SELECT id, sender, text, created_at FROM support_chat_messages WHERE chat_id = $1 AND id > $2 ORDER BY id ASC LIMIT 200', [id, since]);
+        res.json({ success: true, chat: liveSupportPublic(c.rows[0]), messages: ms.rows.map(m => ({ id: m.id, sender: m.sender, text: m.text, createdAt: m.created_at })) });
+    } catch (e) { console.error('[LiveSupport] get:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/live/:id/claim', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    if (!liveSupportIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    try {
+        // atomar: der erste Admin gewinnt
+        const r = await pool.query(`UPDATE support_chats SET status = 'active', admin_commander_id = $2, started_at = now(), last_msg_at = now() WHERE id = $1 AND status = 'waiting' RETURNING *`, [id, caller.commanderId]);
+        if (!r.rows.length) return res.status(409).json({ success: false, error: 'Dieses Gespräch ist schon übernommen oder beendet.' });
+        await pool.query(`INSERT INTO support_chat_messages (chat_id, sender, text) VALUES ($1, 'admin', $2)`, [id, 'Hallo! Hier ist der VIRGO-Support. Wie kann ich dir helfen?']);
+        res.json({ success: true, chat: liveSupportPublic(r.rows[0]) });
+    } catch (e) { console.error('[LiveSupport] claim:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/live/:id/message', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10);
+    const text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim();
+    if (!id || !text) return res.status(400).json({ success: false, error: 'Nachricht fehlt.' });
+    if (text.length > LIVE_SUPPORT_MAX_TEXT) return res.status(400).json({ success: false, error: `Zu lang (max. ${LIVE_SUPPORT_MAX_TEXT} Zeichen).` });
+    try {
+        const c = await pool.query('SELECT * FROM support_chats WHERE id = $1', [id]);
+        const chat = c.rows[0];
+        if (!chat || !liveSupportMayRead(caller, chat)) return res.status(404).json({ success: false, error: 'Gespräch nicht gefunden.' });
+        if (chat.status !== 'active') return res.status(409).json({ success: false, error: chat.status === 'waiting' ? 'Es hat noch niemand das Gespräch übernommen.' : 'Das Gespräch ist beendet.' });
+        const isAdmin = liveSupportIsAdmin(caller);
+        if (isAdmin && Number(chat.admin_commander_id) !== Number(caller.commanderId)) return res.status(403).json({ success: false, error: 'Dieses Gespräch führt ein anderer Admin.' });
+        if (!isAdmin && wordFilterHit(text) !== null) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
+        if (rateLimited('livemsg|' + caller.playFabId + '|' + id, 1, 1000)) return res.status(429).json({ success: false, error: 'Bitte etwas langsamer.' });
+        const m = await pool.query(`INSERT INTO support_chat_messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id`, [id, isAdmin ? 'admin' : 'player', text]);
+        await pool.query('UPDATE support_chats SET last_msg_at = now() WHERE id = $1', [id]);
+        res.json({ success: true, id: m.rows[0].id });
+    } catch (e) { console.error('[LiveSupport] message:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/live/:id/close', async (req, res) => {
+    const caller = await liveSupportStart(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10);
+    try {
+        const c = await pool.query('SELECT * FROM support_chats WHERE id = $1', [id]);
+        if (!c.rows.length || !liveSupportMayRead(caller, c.rows[0])) return res.status(404).json({ success: false, error: 'Gespräch nicht gefunden.' });
+        const closed = await liveSupportClose(id, liveSupportIsAdmin(caller) ? 'Support' : 'Spieler');
+        res.json({ success: true, alreadyClosed: !closed });
+    } catch (e) { console.error('[LiveSupport] close:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+// SUPPORT48-ENDE
+
+// #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
 // #####################################################################
 
@@ -4697,7 +4891,7 @@ app.post('/notifyAttack', async (req, res) => {
 // -------------------------------------------------------
 const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_charters', 'alliance_charter_signatures',
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
-    'support_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
+    'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
     'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log'];
@@ -7180,6 +7374,10 @@ async function deleteAccountDataFor(playFabId, commanderId) {
                 'UPDATE support_messages SET sender_name = NULL, sender_email = NULL, sender_commander_id = NULL WHERE sender_commander_id = $1',
                 [commanderId]);
             summary.supportMessagesAnonymized = support.rowCount;
+            // NEU 31.10.2026 (§48): Live-Support-Gespraeche dieses Spielers loeschen (Texte + Gespraeche)
+            await client.query('DELETE FROM support_chat_messages WHERE chat_id IN (SELECT id FROM support_chats WHERE commander_id = $1)', [commanderId]);
+            const liveChats = await client.query('DELETE FROM support_chats WHERE commander_id = $1', [commanderId]);
+            summary.supportChatsDeleted = liveChats.rowCount;
         }
 
         const highscore = await client.query(
@@ -7630,6 +7828,7 @@ async function buildPlayerInspectionReport(rawQuery) {
         await count('Urkunden-Unterschriften (Name gespeichert)', 'SELECT COUNT(*) AS cnt FROM alliance_charter_signatures WHERE signer_commander_id = $1', [commanderId]);
         await count('Freundschaften/Kriege (Spieler-Beziehungen)', 'SELECT COUNT(*) AS cnt FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1', [commanderId]);
         await count('Support-Nachrichten dieses Spielers', 'SELECT COUNT(*) AS cnt FROM support_messages WHERE sender_commander_id = $1', [commanderId]);
+        await count('Live-Support-Gespräche (30 Tage)', 'SELECT COUNT(*) AS cnt FROM support_chats WHERE commander_id = $1', [commanderId]);
         await count('Geschenkkisten-Einloesungen', 'SELECT COUNT(*) AS cnt FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
         await count('Promocode-Einloesungen (nur Zahlen, bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM promo_redemptions WHERE commander_id = $1', [commanderId]);
         await count('Kampfberichte als Angreifer/Verteidiger (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
