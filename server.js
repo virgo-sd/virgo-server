@@ -348,6 +348,7 @@ const RATE_RULES = [
     ['POST', /^\/reportBug$/,                          'bug',       5,  3600000],
     ['POST', /^\/report-player$/,                      'reportpl', 10,  3600000],
     ['POST', /^\/supportMessage$/,                     'support',  30,  3600000],
+    ['POST', /^\/blocks/,                              'blocks',   60,  3600000],
     ['POST', /^\/notifyAttack$/,                       'notify',   60,  3600000],
     ['POST', /^\/promo\/redeem$/,                      'promo',    20,  3600000],
     ['POST', /^\/planet\/claim$/,                      'pclaim',   40,  3600000],
@@ -1384,6 +1385,14 @@ async function initDatabase() {
         `);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_reports_reported ON player_reports (reported_commander_id);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_player_reports_cooldown ON player_reports (reporter_commander_id, reported_commander_id, created_at);`);
+        // NEU 01.11.2026 (§50): Meldungen sind jetzt Eintraege im Support-Fenster (Status new/done, Beleg-Zeile aus dem Chat) + Blockierliste je Spieler
+        await pool.query(`ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'new';`);
+        await pool.query(`ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS context TEXT NOT NULL DEFAULT '';`);
+        await pool.query(`ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS handled_at TIMESTAMPTZ;`);
+        await pool.query(`UPDATE player_reports SET status = 'done' WHERE status = 'new' AND created_at < TIMESTAMPTZ '2026-11-01 00:00:00+00';`);   // Altmeldungen vor dem neuen System gelten als erledigt (laufen nicht ins Fenster)
+        await pool.query(`CREATE TABLE IF NOT EXISTS player_blocks (
+            blocker_commander_id INTEGER NOT NULL, blocked_commander_id INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (blocker_commander_id, blocked_commander_id));`);
 
         // NEU 26.09.2026: Galaxie-Register (§26) — serverautoritative Belegung. coord ist PRIMARY KEY, damit
         // eine Besiedlung spaeter atomar ("wer zuerst kommt") per INSERT ... ON CONFLICT DO NOTHING geht.
@@ -3979,6 +3988,7 @@ app.post('/report-player', async (req, res) => {
     const reportedId = parseInt(req.body?.reportedCommanderId, 10);
     const reason = req.body?.reason;
     const message = String(req.body?.message || '').slice(0, 1000);
+    const context = String(req.body?.context || '').replace(/[<>]/g, '').slice(0, 300);   // 01.11.2026 (§50): angeklickte Chat-Zeile als Beleg (vom Melder, nicht pruefbar - nur Hinweis fuer den Admin)
 
     if (!reporterId || !reportedId)
         return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
@@ -4001,9 +4011,9 @@ app.post('/report-player', async (req, res) => {
             return res.status(429).json({ success: false, error: 'Du hast diesen Spieler gerade erst gemeldet. Bitte warte ein paar Minuten.' });
 
         await pool.query(
-            `INSERT INTO player_reports (reporter_commander_id, reported_commander_id, reason, message)
-             VALUES ($1, $2, $3, $4)`,
-            [reporterId, reportedId, reason, message]);
+            `INSERT INTO player_reports (reporter_commander_id, reported_commander_id, reason, message, context)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [reporterId, reportedId, reason, message, context]);
     } catch (error) {
         console.error('[Server] report-player Fehler (Speichern):', error.message);
         return res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
@@ -4578,6 +4588,181 @@ app.post('/alliances/:id/chat', async (req, res) => {
 // ALLIANCECHAT49-ENDE
 
 // #####################################################################
+// §50  MELDEN, BLOCKIEREN, SUPPORT-EINGANG (01.11.2026, Nutzer-Entscheidung; Google-Play-Pflicht fuer Apps mit Chat)
+//      Blockieren: Liste je Spieler auf dem Server (gilt auf jedem Geraet); der Client blendet Chatzeilen und Mails des Blockierten aus.
+//      Melden: landet in player_reports (Status new/done) und erscheint im Support-Fenster (orange "Spieler gemeldet"). Der Admin hat dort
+//      ohne Chat zu oeffnen drei Wege: Gespraech mit dem Melder einleiten (wie Live-Support) / automatische Antwort ("Vielen Dank ...")
+//      / ohne Antwort erledigen. Support-Eingang = gemeinsame Liste aus Live-Anfragen (gelb), Kontaktformularen (lila) und Meldungen (orange).
+//      Nur Admin-Konten (ADMIN_COMMANDER_IDS, per Ticket).
+// #####################################################################
+// MELDEN50-START
+const BLOCK_MAX = 200, INBOX_LIMIT = 50, INBOX_REPLY_MAX = 1500;
+
+function inboxIsAdmin(caller) { return !!caller && ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId)); }
+async function inboxName(commanderId) {
+    try {
+        const r = await pool.query('SELECT commander_name FROM commander_highscore WHERE commander_id = $1', [commanderId]);
+        return r.rows.length ? cleanDisplayName(r.rows[0].commander_name) : '';
+    } catch (e) { return ''; }
+}
+
+app.get('/blocks', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    try {
+        const r = await pool.query(`SELECT b.blocked_commander_id AS id, COALESCE(h.commander_name, '') AS name FROM player_blocks b LEFT JOIN commander_highscore h ON h.commander_id = b.blocked_commander_id WHERE b.blocker_commander_id = $1 ORDER BY b.created_at DESC`, [caller.commanderId]);
+        res.json({ success: true, blocks: r.rows.map(x => ({ id: x.id, name: x.name })) });
+    } catch (e) { console.error('[Block] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/blocks', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.body && req.body.blockedId, 10);
+    if (!id || id < 1000000) return res.status(400).json({ success: false, error: 'Diesen Spieler kann man nicht blockieren.' });
+    if (id === Number(caller.commanderId)) return res.status(400).json({ success: false, error: 'Du kannst dich nicht selbst blockieren.' });
+    try {
+        const name = await inboxName(id);
+        if (!name) return res.status(404).json({ success: false, error: 'Spieler nicht gefunden.' });
+        const have = await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [caller.commanderId, id]);
+        if (!have.rows.length) {
+            const n = await pool.query('SELECT COUNT(*)::int AS n FROM player_blocks WHERE blocker_commander_id = $1', [caller.commanderId]);
+            if (n.rows[0].n >= BLOCK_MAX) return res.status(400).json({ success: false, error: 'Du hast schon ' + BLOCK_MAX + ' Spieler blockiert. Hebe zuerst eine Blockierung auf.' });
+            await pool.query('INSERT INTO player_blocks (blocker_commander_id, blocked_commander_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [caller.commanderId, id]);
+        }
+        res.json({ success: true, id, name });
+    } catch (e) { console.error('[Block] blockieren:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/blocks/remove', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.body && req.body.blockedId, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        await pool.query('DELETE FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [caller.commanderId, id]);
+        res.json({ success: true, id });
+    } catch (e) { console.error('[Block] aufheben:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// Zaehler fuer das Leuchten/den Knopf der Admins (Meldungen und Kontaktformulare, die noch nicht erledigt sind)
+app.get('/support/inbox/counts', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    try {
+        const rep = await pool.query(`SELECT COUNT(*)::int AS n FROM player_reports WHERE status = 'new'`);
+        const frm = await pool.query(`SELECT COUNT(*)::int AS n FROM support_messages WHERE status = 'new'`);
+        res.json({ success: true, reports: rep.rows[0].n, forms: frm.rows[0].n });
+    } catch (e) { console.error('[Eingang] counts:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// Gemeinsame Liste (Live-Anfragen, Meldungen, Kontaktformulare); der Client faerbt und beschriftet nach "kind"
+app.get('/support/inbox', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    try {
+        const live = await pool.query(`SELECT * FROM support_chats WHERE status <> 'closed' ORDER BY (status = 'waiting') DESC, created_at ASC LIMIT $1`, [INBOX_LIMIT]);
+        const reps = await pool.query(`SELECT r.id, r.reporter_commander_id, r.reported_commander_id, r.reason, r.message, r.context, r.created_at, COALESCE(a.commander_name, '') AS reporter_name, COALESCE(b.commander_name, '') AS reported_name FROM player_reports r LEFT JOIN commander_highscore a ON a.commander_id = r.reporter_commander_id LEFT JOIN commander_highscore b ON b.commander_id = r.reported_commander_id WHERE r.status = 'new' ORDER BY r.created_at ASC LIMIT $1`, [INBOX_LIMIT]);
+        const forms = await pool.query(`SELECT id, sender_commander_id, sender_name, message, status, created_at FROM support_messages WHERE status IN ('new', 'read') ORDER BY created_at ASC LIMIT $1`, [INBOX_LIMIT]);
+        const items = [];
+        live.rows.forEach(c => items.push({ kind: 'live', id: c.id, name: c.name, commanderId: c.commander_id, text: c.topic, status: c.status, unverified: !!c.unverified, adminCommanderId: c.admin_commander_id || 0, createdAt: c.created_at }));
+        reps.rows.forEach(x => items.push({ kind: 'report', id: x.id, name: x.reported_name || ('Commander #' + x.reported_commander_id), commanderId: x.reported_commander_id, reporterId: x.reporter_commander_id, reporterName: x.reporter_name || ('Commander #' + x.reporter_commander_id), reason: x.reason, text: x.message, context: x.context || '', status: 'new', createdAt: x.created_at }));
+        forms.rows.forEach(f => items.push({ kind: 'form', id: f.id, name: f.sender_name || 'unbekannt', commanderId: f.sender_commander_id || 0, text: f.message, status: f.status, createdAt: f.created_at }));
+        res.json({ success: true, items });
+    } catch (e) { console.error('[Eingang] liste:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// Meldung atomar auf "erledigt" setzen (der erste Admin gewinnt); null, wenn schon bearbeitet
+async function reportClaim(id) {
+    const r = await pool.query(`UPDATE player_reports SET status = 'done', handled_at = now() WHERE id = $1 AND status = 'new' RETURNING *`, [id]);
+    return r.rows.length ? r.rows[0] : null;
+}
+async function reportReopen(id) { try { await pool.query(`UPDATE player_reports SET status = 'new', handled_at = NULL WHERE id = $1`, [id]); } catch (e) { /* bleibt erledigt, schlimmstenfalls manuell */ } }
+
+app.post('/support/inbox/report/:id/auto', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        const rep = await reportClaim(id);
+        if (!rep) return res.status(409).json({ success: false, error: 'Diese Meldung ist schon bearbeitet.' });
+        const name = (await inboxName(rep.reported_commander_id)) || ('Commander #' + rep.reported_commander_id);
+        try { await supportMailTo(rep.reporter_commander_id, 'Deine Meldung', 'Vielen Dank für deine Meldung. Wir werden dein Anliegen gegen Spieler ' + name + ' prüfen.'); }
+        catch (e) { await reportReopen(id); console.error('[Eingang] Antwort-Mail:', e.message); return res.status(502).json({ success: false, error: 'Zustellung fehlgeschlagen: ' + e.message }); }
+        res.json({ success: true });
+    } catch (e) { console.error('[Eingang] auto:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/inbox/report/:id/silent', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        const rep = await reportClaim(id);
+        if (!rep) return res.status(409).json({ success: false, error: 'Diese Meldung ist schon bearbeitet.' });
+        res.json({ success: true });
+    } catch (e) { console.error('[Eingang] silent:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// Gespraech mit dem Melder einleiten: legt ein aktives Live-Support-Gespraech an (Admin = uebernommen) mit einer ersten Nachricht
+app.post('/support/inbox/report/:id/talk', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        const cur = await pool.query(`SELECT reporter_commander_id, reported_commander_id, reason, status FROM player_reports WHERE id = $1`, [id]);
+        if (!cur.rows.length || cur.rows[0].status !== 'new') return res.status(409).json({ success: false, error: 'Diese Meldung ist schon bearbeitet.' });
+        const reporterId = cur.rows[0].reporter_commander_id;
+        const open = await pool.query(`SELECT id FROM support_chats WHERE commander_id = $1 AND status <> 'closed' LIMIT 1`, [reporterId]);
+        if (open.rows.length) return res.status(409).json({ success: false, error: 'Der Melder hat schon ein offenes Support-Gespräch.' });
+        const info = await stationedLookupCommander(reporterId);
+        if (!info) return res.status(404).json({ success: false, error: 'Der Melder wurde nicht gefunden.' });
+        const rep = await reportClaim(id);
+        if (!rep) return res.status(409).json({ success: false, error: 'Diese Meldung ist schon bearbeitet.' });
+        try {
+            const reportedName = (await inboxName(rep.reported_commander_id)) || ('Commander #' + rep.reported_commander_id);
+            const topic = ('Meldung gegen ' + reportedName + ': ' + rep.reason).slice(0, 150);
+            const c = await pool.query(`INSERT INTO support_chats (commander_id, pfid, name, topic, status, admin_commander_id, started_at, last_msg_at, unverified) VALUES ($1, $2, $3, $4, 'active', $5, now(), now(), false) RETURNING *`, [reporterId, info.playFabId, info.name || ('Commander #' + reporterId), topic, caller.commanderId]);
+            await pool.query(`INSERT INTO support_chat_messages (chat_id, sender, text) VALUES ($1, 'admin', $2)`, [c.rows[0].id, 'Hallo! Hier ist der VIRGO-Support. Es geht um deine Meldung gegen ' + reportedName + ' (' + rep.reason + '). Magst du mir kurz mehr dazu erzählen?']);
+            res.json({ success: true, chat: liveSupportPublic(c.rows[0]) });
+        } catch (e) { await reportReopen(id); throw e; }
+    } catch (e) { console.error('[Eingang] talk:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/support/inbox/form/:id/reply', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    const text = String((req.body && req.body.text) || '').trim();
+    if (!id || !text) return res.status(400).json({ success: false, error: 'Antworttext fehlt.' });
+    if (text.length > INBOX_REPLY_MAX) return res.status(400).json({ success: false, error: 'Antwort zu lang (höchstens ' + INBOX_REPLY_MAX + ' Zeichen).' });
+    try {
+        const r = await pool.query('SELECT id, sender_commander_id, message, status FROM support_messages WHERE id = $1', [id]);
+        if (!r.rows.length) return res.status(404).json({ success: false, error: 'Nachricht nicht gefunden.' });
+        const row = r.rows[0];
+        if (!row.sender_commander_id) return res.status(400).json({ success: false, error: 'Der Absender war nicht angemeldet - keine Antwort möglich. Du kannst die Nachricht als erledigt markieren.' });
+        if (row.status === 'done') return res.status(409).json({ success: false, error: 'Schon beantwortet oder erledigt.' });
+        const quote = row.message.length > 200 ? row.message.slice(0, 200) + ' ...' : row.message;
+        await supportMailTo(row.sender_commander_id, 'Antwort vom VIRGO-Support', text + '\n\n---\nDeine Nachricht:\n' + quote);
+        await pool.query(`UPDATE support_messages SET status = 'done', is_read = true, reply = $2, replied_at = now() WHERE id = $1`, [id, text]);
+        res.json({ success: true });
+    } catch (e) { console.error('[Eingang] form reply:', e.message); res.status(500).json({ success: false, error: 'Zustellung fehlgeschlagen: ' + e.message }); }
+});
+
+app.post('/support/inbox/form/:id/done', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Nummer.' });
+    try {
+        const r = await pool.query(`UPDATE support_messages SET status = 'done', is_read = true WHERE id = $1`, [id]);
+        if (r.rowCount === 0) return res.status(404).json({ success: false, error: 'Nachricht nicht gefunden.' });
+        res.json({ success: true });
+    } catch (e) { console.error('[Eingang] form done:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+// MELDEN50-ENDE
+
+// #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
 // #####################################################################
 
@@ -5036,7 +5221,7 @@ app.post('/notifyAttack', async (req, res) => {
 // -------------------------------------------------------
 const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_chat', 'alliance_charters', 'alliance_charter_signatures',
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
-    'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
+    'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
     'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log'];
@@ -7526,6 +7711,9 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             // NEU 01.11.2026 (§49): Allianzchat-Zeilen dieses Spielers (Nachrichten und Systemmeldungen ueber ihn) loeschen
             const acRows = await client.query('DELETE FROM alliance_chat WHERE sender_commander_id = $1', [commanderId]);
             summary.allianceChatDeleted = acRows.rowCount;
+            // NEU 01.11.2026 (§50): Blockierliste (eigene Eintraege und Eintraege ueber diesen Spieler) loeschen
+            const blockRows = await client.query('DELETE FROM player_blocks WHERE blocker_commander_id = $1 OR blocked_commander_id = $1', [commanderId]);
+            summary.blocksDeleted = blockRows.rowCount;
         }
 
         const highscore = await client.query(
@@ -7978,6 +8166,7 @@ async function buildPlayerInspectionReport(rawQuery) {
         await count('Support-Nachrichten dieses Spielers', 'SELECT COUNT(*) AS cnt FROM support_messages WHERE sender_commander_id = $1', [commanderId]);
         await count('Live-Support-Gespräche (30 Tage)', 'SELECT COUNT(*) AS cnt FROM support_chats WHERE commander_id = $1', [commanderId]);
         await count('Allianzchat-Zeilen (letzte 200 je Allianz)', 'SELECT COUNT(*) AS cnt FROM alliance_chat WHERE sender_commander_id = $1', [commanderId]);
+        await count('Blockierte Spieler (deine Liste)', 'SELECT COUNT(*) AS cnt FROM player_blocks WHERE blocker_commander_id = $1', [commanderId]);
         await count('Geschenkkisten-Einloesungen', 'SELECT COUNT(*) AS cnt FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
         await count('Promocode-Einloesungen (nur Zahlen, bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM promo_redemptions WHERE commander_id = $1', [commanderId]);
         await count('Kampfberichte als Angreifer/Verteidiger (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
