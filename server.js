@@ -504,6 +504,56 @@ function wordFilterHit(text) {
     }
     return null;
 }
+// NEU 01.11.2026: Maskieren statt Ablehnen (Chat). "Arschloch" -> "Ar***h"; bei kurzen Woertern bleibt weniger stehen. Gibt { text, hits } zurueck.
+function wfMaskToken(tok) {
+    var idx = [], i;
+    for (i = 0; i < tok.length; i++) if (/[A-Za-z0-9\u00c0-\u024f]/.test(tok.charAt(i))) idx.push(i);
+    var n = idx.length, keepStart = n >= 5 ? 2 : (n >= 3 ? 1 : 0), keepEnd = n >= 5 ? 1 : 0;
+    var out = tok.split('');
+    for (i = keepStart; i < n - keepEnd; i++) out[idx[i]] = '*';
+    return out.join('');
+}
+function wfApplyMask(src, toks) {
+    var out = src, i;
+    for (i = toks.length - 1; i >= 0; i--) if (toks[i].mask) out = out.slice(0, toks[i].at) + wfMaskToken(toks[i].s) + out.slice(toks[i].at + toks[i].s.length);
+    return out;
+}
+function wordFilterMask(text) {
+    var src = String(text == null ? '' : text);
+    var re = /\S+/g, toks = [], m, hits = 0, i, j, k;
+    while ((m = re.exec(src)) !== null) toks.push({ s: m[0], at: m.index, mask: false });
+    for (i = 0; i < toks.length; i++) if (wordFilterHit(toks[i].s)) { toks[i].mask = true; hits++; }
+    // verteilte Woerter ("a r s c h l o c h"): kleinstes Fenster aufeinanderfolgender Woerter, das zusammen trifft
+    if (wordFilterHit(src)) {
+        i = 0;
+        while (i < toks.length) {
+            if (toks[i].mask) { i++; continue; }
+            var found = -1;
+            for (j = i; j < toks.length && j < i + 14 && !toks[j].mask; j++) {
+                var parts = [];
+                for (k = i; k <= j; k++) parts.push(toks[k].s);
+                if (wordFilterHit(parts.join(' '))) { found = j; break; }
+            }
+            if (found < 0) { i++; continue; }
+            var from = i;
+            while (from < found) {
+                var p2 = [];
+                for (k = from + 1; k <= found; k++) p2.push(toks[k].s);
+                if (wordFilterHit(p2.join(' '))) from++; else break;
+            }
+            for (k = from; k <= found; k++) toks[k].mask = true;
+            hits++;
+            i = found + 1;
+        }
+    }
+    var res = wfApplyMask(src, toks);
+    if (wordFilterHit(res)) {   // Sicherheitsnetz: trifft es trotzdem noch, alles Wort fuer Wort verdecken
+        for (i = 0; i < toks.length; i++) toks[i].mask = true;
+        res = wfApplyMask(src, toks);
+        if (hits === 0) hits = 1;
+    }
+    return { text: res, hits: hits };
+}
 // WORTFILTER-ENDE
 
 function adminKeyOk(provided) {
@@ -4347,10 +4397,11 @@ app.post('/support/live/presence', async (req, res) => {
 
 app.post('/support/live/request', async (req, res) => {
     const caller = await liveSupportStart(req, res); if (!caller) return;
-    const topic = String((req.body && req.body.topic) || '').trim().slice(0, LIVE_SUPPORT_MAX_TEXT);
+    let topic = String((req.body && req.body.topic) || '').trim().slice(0, LIVE_SUPPORT_MAX_TEXT);
     if (!topic) return res.status(400).json({ success: false, error: 'Bitte beschreibe kurz, worum es geht.' });
     if (!liveSupportOnline()) return res.status(409).json({ success: false, code: 'SUPPORT_OFFLINE', error: 'Gerade ist niemand vom Support erreichbar. Bitte nutze das Support-Formular.' });
-    if (wordFilterHit(topic)) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
+    let topicMasked = false;   // 01.11.2026: Beleidigungen werden maskiert ("Ar******h") statt abgelehnt
+    { const wf = wordFilterMask(topic); if (wf.hits > 0) { topic = wf.text; topicMasked = true; } }
     try {
         if (LIVE_SUPPORT_VERIFIED_ONLY && !liveSupportIsAdmin(caller) && EMAIL_GATE_ON && !(await emailVerifiedFor(caller.playFabId)))
             return res.status(403).json({ success: false, code: 'EMAIL_UNVERIFIED', error: 'Für den Live-Support brauchst du eine bestätigte E-Mail-Adresse. Bis dahin hilft dir das Support-Formular.' });
@@ -4361,7 +4412,7 @@ app.post('/support/live/request', async (req, res) => {
         const prof = await verifiedProfile(caller, req.body && req.body.name, null);
         const r = await pool.query(`INSERT INTO support_chats (commander_id, pfid, name, topic, status) VALUES ($1, $2, $3, $4, 'waiting') RETURNING *`, [caller.commanderId, caller.playFabId, prof.name, topic]);
         const ahead = await pool.query(`SELECT COUNT(*)::int AS n FROM support_chats WHERE status = 'waiting' AND id < $1`, [r.rows[0].id]);
-        res.json({ success: true, chat: liveSupportPublic(r.rows[0]), position: ahead.rows[0].n + 1 });
+        res.json({ success: true, chat: liveSupportPublic(r.rows[0]), position: ahead.rows[0].n + 1, masked: topicMasked });
     } catch (e) { console.error('[LiveSupport] request:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
@@ -4402,7 +4453,7 @@ app.post('/support/live/:id/claim', async (req, res) => {
 app.post('/support/live/:id/message', async (req, res) => {
     const caller = await liveSupportStart(req, res); if (!caller) return;
     const id = parseInt(req.params.id, 10);
-    const text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim();
+    let text = String((req.body && req.body.text) || '').replace(/\s+/g, ' ').trim();
     if (!id || !text) return res.status(400).json({ success: false, error: 'Nachricht fehlt.' });
     if (text.length > LIVE_SUPPORT_MAX_TEXT) return res.status(400).json({ success: false, error: `Zu lang (max. ${LIVE_SUPPORT_MAX_TEXT} Zeichen).` });
     try {
@@ -4412,11 +4463,12 @@ app.post('/support/live/:id/message', async (req, res) => {
         if (chat.status !== 'active') return res.status(409).json({ success: false, error: chat.status === 'waiting' ? 'Es hat noch niemand das Gespräch übernommen.' : 'Das Gespräch ist beendet.' });
         const isAdmin = liveSupportIsAdmin(caller);
         if (isAdmin && Number(chat.admin_commander_id) !== Number(caller.commanderId)) return res.status(403).json({ success: false, error: 'Dieses Gespräch führt ein anderer Admin.' });
-        if (!isAdmin && wordFilterHit(text) !== null) return res.status(400).json({ success: false, code: 'WORTFILTER', error: WORDFILTER_MESSAGE });
+        let masked = false;   // 01.11.2026: Spieler-Nachrichten werden maskiert statt abgelehnt (Admin ausgenommen)
+        if (!isAdmin) { const wf = wordFilterMask(text); if (wf.hits > 0) { text = wf.text; masked = true; } }
         if (rateLimited('livemsg|' + caller.playFabId + '|' + id, 1, 1000)) return res.status(429).json({ success: false, error: 'Bitte etwas langsamer.' });
         const m = await pool.query(`INSERT INTO support_chat_messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id`, [id, isAdmin ? 'admin' : 'player', text]);
         await pool.query('UPDATE support_chats SET last_msg_at = now() WHERE id = $1', [id]);
-        res.json({ success: true, id: m.rows[0].id });
+        res.json({ success: true, id: m.rows[0].id, masked });
     } catch (e) { console.error('[LiveSupport] message:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
