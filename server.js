@@ -386,7 +386,7 @@ app.use((req, res, next) => {
 // #####################################################################
 // §46  E-MAIL-PFLICHT, CLIENT-MINDESTVERSION, TEXTPRUEFUNG (NEU 31.10.2026, "Store-reif")
 //   (a) E-Mail-Sperre: Handel (anlegen/kaufen/abbrechen), Transport an andere Spieler, Allianz gruenden (Satzung + Unterschrift) und
-//       Allianz-Rundmails verlangen eine BESTAETIGTE E-Mail-Adresse (emailStateOf, §42). Ansehen bleibt erlaubt (der Client zeigt nur
+//       Allianz-Rundmails, Einzahlungen in die Allianzkasse und das Oeffnen von Kisten (seit 01.11.2026) verlangen eine BESTAETIGTE E-Mail-Adresse (emailStateOf, §42). Ansehen bleibt erlaubt (der Client zeigt nur
 //       Schleier/Hinweise; DIESE Sperre ist die verbindliche - Fairplay-Regel). Admin-Konten sind ausgenommen. Schalter: EMAIL_GATE=off.
 //       Zwischenspeicher: bestaetigt 10 Min., unbestaetigt 30 s (nach dem Klick auf den Link in der Mail geht es also schnell frei).
 //   (b) Client-Mindestversion: CLIENT_MIN_VERSION (Render-Variable, Standard 0 = aus). Der Client schickt X-Client-Version (ganze Zahl,
@@ -402,7 +402,9 @@ const EMAIL_GATED = [   // [Methode, Pfad, Bezeichnung fuer die Meldung]
     ['POST', /^\/transport\/deliver$/,                 'Transporte an andere Spieler'],
     ['POST', /^\/alliances\/charter$/,                 'das Gründen einer Allianz'],
     ['POST', /^\/alliances\/charter\/[0-9]+\/sign$/,   'das Gründen einer Allianz'],
-    ['POST', /^\/alliances\/[0-9]+\/broadcast-mail$/,  'Rundmails']
+    ['POST', /^\/alliances\/[0-9]+\/broadcast-mail$/,  'Rundmails'],
+    ['POST', /^\/alliance-treasury\/deposit$/,         'Einzahlungen in die Allianzkasse'],   // 01.11.2026 (Nutzer-Entscheidung)
+    ['POST', /^\/inventory\/use$/,                     'das Öffnen von Kisten']               // 01.11.2026 (Nutzer-Entscheidung); Inventar ansehen bleibt frei
 ];
 const emailGateCache = new Map(); // playFabId -> { verified, expires }
 const EMAIL_GATE_OK_MS = 10 * 60 * 1000, EMAIL_GATE_NO_MS = 30 * 1000;
