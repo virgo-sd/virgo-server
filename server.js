@@ -4530,11 +4530,12 @@ app.get('/alliances/:id/chat', async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'Ungültige Allianz.' });
     try {
         if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
-        const cols = 'id, sender_commander_id, sender_name, text, kind, unverified, created_at';
+        const cols = 'c.id, c.sender_commander_id, c.sender_name, c.text, c.kind, c.unverified, c.created_at, COALESCE(h.avatar_index, 0) AS avatar';
+        const from = ' FROM alliance_chat c LEFT JOIN commander_highscore h ON h.commander_id = c.sender_commander_id WHERE c.alliance_id = $1';
         const r = since > 0
-            ? await pool.query('SELECT ' + cols + ' FROM alliance_chat WHERE alliance_id = $1 AND id > $2 ORDER BY id ASC LIMIT 200', [id, since])
-            : await pool.query('SELECT * FROM (SELECT ' + cols + ' FROM alliance_chat WHERE alliance_id = $1 ORDER BY id DESC LIMIT 100) t ORDER BY id ASC', [id]);
-        res.json({ success: true, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+            ? await pool.query('SELECT ' + cols + from + ' AND c.id > $2 ORDER BY c.id ASC LIMIT 200', [id, since])
+            : await pool.query('SELECT * FROM (SELECT ' + cols + from + ' ORDER BY c.id DESC LIMIT 100) t ORDER BY t.id ASC', [id]);
+        res.json({ success: true, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
     } catch (e) { console.error('[Allianzchat] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
