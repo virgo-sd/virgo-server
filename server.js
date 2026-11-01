@@ -1023,6 +1023,11 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, chat_id INTEGER NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chats_commander ON support_chats (commander_id, status);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chat_messages_chat ON support_chat_messages (chat_id, id);`);
+        // NEU 01.11.2026 (§49): Allianzchat
+        await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat (
+            id SERIAL PRIMARY KEY, alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE, sender_commander_id INTEGER, sender_name TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
 
         // -------------------------------------------------------
         // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
@@ -2285,6 +2290,7 @@ app.post('/alliances/:id/join', async (req, res) => {
         await sendAllianceMail(commanderId, commanderCoord,
             'Allianz beigetreten', // LOCALIZE
             `Du bist der Allianz "${alliance.name}" [${alliance.tag}] beigetreten.`); // LOCALIZE
+        await allianceChatSystem(id, commanderId, commanderName || 'Unbekannt', 'Herzlich willkommen in der Allianz!');   // §49
 
         res.json({ success: true });
     } catch (error) {
@@ -2425,6 +2431,7 @@ app.post('/alliances/:id/applications/:appId/accept', async (req, res) => {
         await sendAllianceMail(application.commander_id, application.commander_coord,
             'Bewerbung angenommen', // LOCALIZE
             `Deine Bewerbung bei der Allianz "${alliance.name}" [${alliance.tag}] wurde angenommen! Willkommen an Bord.`); // LOCALIZE
+        await allianceChatSystem(id, application.commander_id, application.commander_name, 'Herzlich willkommen in der Allianz!');   // §49
 
         res.json({ success: true });
     } catch (error) {
@@ -2500,7 +2507,7 @@ app.post('/alliances/:id/leave', async (req, res) => {
 
         // Koordinate + Allianzname VOR dem Löschen holen (danach weg)
         const memberResult = await pool.query(
-            'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            'SELECT commander_coord, commander_name FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
             [id, commanderId]
         );
         const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
@@ -2531,6 +2538,7 @@ app.post('/alliances/:id/leave', async (req, res) => {
                     'Allianz aufgelöst', // LOCALIZE
                     `Die Allianz "${alliance.name}" [${alliance.tag}] wurde aufgelöst, da du als letztes Mitglied ausgetreten bist. Name und Tag sind wieder frei verfügbar.`); // LOCALIZE
             } else {
+                await allianceChatSystem(id, commanderId, memberResult.rows[0].commander_name, 'hat die Allianz verlassen.');   // §49
                 await sendAllianceMail(commanderId, coord,
                     'Allianz verlassen', // LOCALIZE
                     `Du hast die Allianz "${alliance.name}" [${alliance.tag}] verlassen.`); // LOCALIZE
@@ -2985,7 +2993,7 @@ app.post('/alliances/:id/members/:commanderId/kick', async (req, res) => {
             return res.status(403).json({ success: false, error: 'Du kannst nur Mitglieder unterhalb deines eigenen Rangs entfernen.' });
 
         const memberResult = await pool.query(
-            'SELECT commander_coord FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
+            'SELECT commander_coord, commander_name FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2',
             [id, targetCommanderId]
         );
         const allianceResult = await pool.query('SELECT name, tag FROM alliances WHERE id = $1', [id]);
@@ -2994,6 +3002,7 @@ app.post('/alliances/:id/members/:commanderId/kick', async (req, res) => {
 
         if (memberResult.rows.length > 0 && allianceResult.rows.length > 0) {
             const alliance = allianceResult.rows[0];
+            await allianceChatSystem(id, targetCommanderId, memberResult.rows[0].commander_name, 'wurde aus der Allianz entfernt.');   // §49
             await sendAllianceMail(targetCommanderId, memberResult.rows[0].commander_coord,
                 'Aus der Allianz entfernt', // LOCALIZE
                 `Du wurdest aus der Allianz "${alliance.name}" [${alliance.tag}] entfernt.`); // LOCALIZE
@@ -3296,6 +3305,8 @@ app.post('/alliances/charter/:id/sign', async (req, res) => {
             );
         }
 
+        await allianceChatSystem(newAlliance.id, charter.founder_commander_id, charter.founder_name, 'hat die Allianz gegründet.');   // §49
+        for (const sig of signatures.rows) await allianceChatSystem(newAlliance.id, sig.signer_commander_id, sig.signer_name, 'Herzlich willkommen in der Allianz!');   // §49
         // Gründungs-Mail an ALLE Beteiligten (Gründer + Unterzeichner)
         const foundedSubject = 'Allianz gegründet!'; // LOCALIZE
         const foundedBody = `Die Allianz "${newAlliance.name}" [${newAlliance.tag}] (ID ${displayId}) wurde erfolgreich gegründet!`; // LOCALIZE
@@ -4485,6 +4496,77 @@ app.post('/support/live/:id/close', async (req, res) => {
 // SUPPORT48-ENDE
 
 // #####################################################################
+// §49  ALLIANZCHAT (01.11.2026): eigener Chat je Allianz (Postgres), nur fuer Mitglieder, alle Raenge lesen und schreiben.
+//      Regeln wie im globalen Chat: Nachricht max. 80 Zeichen, Abstand 1,5 s; ohne bestaetigte E-Mail "Unregistriert", max. 30 Zeichen, Abstand 15 s;
+//      Beleidigungen werden MASKIERT ("Ar******h") und trotzdem gesendet (Antwort "masked" -> Client sperrt das Eingabefeld kurz).
+//      Systemmeldungen (kind = 'system') entstehen bei Beitritt/Bewerbung angenommen/Gruendung, Austritt und Kick; sender_* = betroffener Spieler (Name im Client anklickbar).
+//      Aufbewahrung: die letzten 200 Zeilen je Allianz; mit der Allianz (CASCADE) und bei Kontoloeschung (Zeilen des Spielers) geloescht.
+// #####################################################################
+// ALLIANCECHAT49-START
+const ALLIANCE_CHAT_KEEP = 200, ALLIANCE_CHAT_MAX_TEXT = 80, ALLIANCE_CHAT_UNVERIFIED_MAX = 30;
+const ALLIANCE_CHAT_GAP_MS = 1500, ALLIANCE_CHAT_UNVERIFIED_GAP_MS = 15000;
+
+async function allianceChatTrim(allianceId) {
+    await pool.query('DELETE FROM alliance_chat WHERE alliance_id = $1 AND id NOT IN (SELECT id FROM alliance_chat WHERE alliance_id = $1 ORDER BY id DESC LIMIT $2)', [allianceId, ALLIANCE_CHAT_KEEP]);
+}
+
+// Systemmeldung fuer einen Spieler ("Herzlich willkommen in der Allianz!", "hat die Allianz verlassen." ...). Kippt NIE die eigentliche Allianz-Aktion.
+async function allianceChatSystem(allianceId, targetCommanderId, targetName, text) {
+    try {
+        await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind) VALUES ($1, $2, $3, $4, 'system')",
+            [allianceId, targetCommanderId || null, String(targetName || '').slice(0, 32), text]);
+        await allianceChatTrim(allianceId);
+    } catch (e) { console.error('[Allianzchat] Systemmeldung fehlgeschlagen:', e.message); }
+}
+
+async function allianceChatIsMember(commanderId, allianceId) {
+    const r = await pool.query('SELECT 1 FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [allianceId, commanderId]);
+    return r.rows.length > 0;
+}
+
+app.get('/alliances/:id/chat', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10), since = parseInt(req.query.since, 10) || 0;
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Allianz.' });
+    try {
+        if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
+        const cols = 'id, sender_commander_id, sender_name, text, kind, unverified, created_at';
+        const r = since > 0
+            ? await pool.query('SELECT ' + cols + ' FROM alliance_chat WHERE alliance_id = $1 AND id > $2 ORDER BY id ASC LIMIT 200', [id, since])
+            : await pool.query('SELECT * FROM (SELECT ' + cols + ' FROM alliance_chat WHERE alliance_id = $1 ORDER BY id DESC LIMIT 100) t ORDER BY id ASC', [id]);
+        res.json({ success: true, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+    } catch (e) { console.error('[Allianzchat] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/alliances/:id/chat', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10);
+    let text = String((req.body && req.body.text) || '').replace(/[<>\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, '').replace(/\s+/g, ' ').trim();
+    if (!id || !text) return res.status(400).json({ success: false, error: 'Nachricht fehlt.' });
+    if (text.length > ALLIANCE_CHAT_MAX_TEXT) return res.status(400).json({ success: false, error: 'Ungültige Nachricht (zu lang).' });
+    try {
+        if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
+        let unverified = false;
+        if (EMAIL_GATE_ON && !ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) {
+            try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; }   // Pruefung nicht moeglich: nicht bestrafen
+        }
+        if (unverified && text.length > ALLIANCE_CHAT_UNVERIFIED_MAX)
+            return res.status(400).json({ success: false, error: 'Ohne bestätigte E-Mail-Adresse sind nur kurze Nachrichten möglich (höchstens ' + ALLIANCE_CHAT_UNVERIFIED_MAX + ' Zeichen).' });
+        if (rateLimited('acgap|' + caller.playFabId, 1, unverified ? ALLIANCE_CHAT_UNVERIFIED_GAP_MS : ALLIANCE_CHAT_GAP_MS))
+            return res.status(429).json({ success: false, error: unverified ? 'Ohne bestätigte E-Mail-Adresse kannst du nur alle ' + (ALLIANCE_CHAT_UNVERIFIED_GAP_MS / 1000) + ' Sekunden schreiben.' : 'Bitte nicht so schnell schreiben.' });
+        let masked = false;
+        const wf = wordFilterMask(text);
+        if (wf.hits > 0) { text = wf.text; masked = true; }
+        const prof = await verifiedProfile(caller, null, null);
+        const r = await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind, unverified) VALUES ($1, $2, $3, $4, 'msg', $5) RETURNING id",
+            [id, caller.commanderId, prof.name, text, unverified]);
+        await allianceChatTrim(id);
+        res.json({ success: true, id: r.rows[0].id, masked, text });
+    } catch (e) { console.error('[Allianzchat] schreiben:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+// ALLIANCECHAT49-ENDE
+
+// #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
 // #####################################################################
 
@@ -4941,7 +5023,7 @@ app.post('/notifyAttack', async (req, res) => {
 // Liefert ALLE Zeilen der unten genannten Tabellen als JSON + den Stand der Nummernfolgen. Enthaelt Pseudonyme und Freitexte -> nur lokal speichern.
 // Aufruf: GET /admin/db-export?key=...   (optional &tables=alliances,alliance_members)
 // -------------------------------------------------------
-const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_charters', 'alliance_charter_signatures',
+const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'alliance_applications', 'alliance_chat', 'alliance_charters', 'alliance_charter_signatures',
     'alliance_relationships', 'player_relationships', 'commander_highscore', 'legal_texts', 'dev_todos', 'announcements', 'virgodom_messages',
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
@@ -7430,6 +7512,9 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             await client.query('DELETE FROM support_chat_messages WHERE chat_id IN (SELECT id FROM support_chats WHERE commander_id = $1)', [commanderId]);
             const liveChats = await client.query('DELETE FROM support_chats WHERE commander_id = $1', [commanderId]);
             summary.supportChatsDeleted = liveChats.rowCount;
+            // NEU 01.11.2026 (§49): Allianzchat-Zeilen dieses Spielers (Nachrichten und Systemmeldungen ueber ihn) loeschen
+            const acRows = await client.query('DELETE FROM alliance_chat WHERE sender_commander_id = $1', [commanderId]);
+            summary.allianceChatDeleted = acRows.rowCount;
         }
 
         const highscore = await client.query(
@@ -7881,6 +7966,7 @@ async function buildPlayerInspectionReport(rawQuery) {
         await count('Freundschaften/Kriege (Spieler-Beziehungen)', 'SELECT COUNT(*) AS cnt FROM player_relationships WHERE commander_id_a = $1 OR commander_id_b = $1', [commanderId]);
         await count('Support-Nachrichten dieses Spielers', 'SELECT COUNT(*) AS cnt FROM support_messages WHERE sender_commander_id = $1', [commanderId]);
         await count('Live-Support-Gespräche (30 Tage)', 'SELECT COUNT(*) AS cnt FROM support_chats WHERE commander_id = $1', [commanderId]);
+        await count('Allianzchat-Zeilen (letzte 200 je Allianz)', 'SELECT COUNT(*) AS cnt FROM alliance_chat WHERE sender_commander_id = $1', [commanderId]);
         await count('Geschenkkisten-Einloesungen', 'SELECT COUNT(*) AS cnt FROM giftbox_claims WHERE playfab_id = $1', [playFabId]);
         await count('Promocode-Einloesungen (nur Zahlen, bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM promo_redemptions WHERE commander_id = $1', [commanderId]);
         await count('Kampfberichte als Angreifer/Verteidiger (bleiben bewusst)', 'SELECT COUNT(*) AS cnt FROM combat_reports WHERE attacker_commander_id = $1 OR defender_commander_id = $1', [commanderId]);
