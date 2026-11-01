@@ -1022,6 +1022,7 @@ async function initDatabase() {
         await pool.query(`CREATE TABLE IF NOT EXISTS support_chat_messages (
             id SERIAL PRIMARY KEY, chat_id INTEGER NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chats_commander ON support_chats (commander_id, status);`);
+        await pool.query(`ALTER TABLE support_chats ADD COLUMN IF NOT EXISTS unverified BOOLEAN NOT NULL DEFAULT false;`);   // 01.11.2026: Spieler ohne bestaetigte E-Mail (strengere Limits, Kennzeichnung)
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_chat_messages_chat ON support_chat_messages (chat_id, id);`);
         // NEU 01.11.2026 (§49): Allianzchat
         await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat (
@@ -4317,7 +4318,8 @@ app.post('/admin/support/reply', async (req, res) => {
 //      Personendaten: Gespraeche werden bei Kontoloeschung geloescht und stehen in der Daten-Auskunft.
 // #####################################################################
 // SUPPORT48-START
-const LIVE_SUPPORT_VERIFIED_ONLY = true;           // Frage 2 des Konzepts: nur mit bestaetigter E-Mail
+const LIVE_SUPPORT_VERIFIED_ONLY = false;          // Nutzer 01.11.2026: Support fuer JEDEN erreichbar (auch ohne bestaetigte E-Mail); Unbestaetigte haben strengere Limits (unten)
+const LIVE_SUPPORT_UNVERIFIED_MAX_TEXT = 150, LIVE_SUPPORT_UNVERIFIED_REQ_GAP_MS = 300000, LIVE_SUPPORT_UNVERIFIED_REQ_PER_DAY = 3, LIVE_SUPPORT_UNVERIFIED_MSG_GAP_MS = 3000;
 const LIVE_SUPPORT_PRESENCE_MS   = 2 * 60 * 1000;  // Admin gilt so lange als bereit
 const LIVE_SUPPORT_IDLE_MS       = 15 * 60 * 1000; // Auto-Ende (aktives Gespraech ohne Nachricht)
 const LIVE_SUPPORT_WAIT_MS       = 30 * 60 * 1000; // Anfrage ohne Admin verfaellt
@@ -4339,7 +4341,7 @@ function liveSupportProtocol(chat, msgs, closedBy) {
     const start = new Date(chat.started_at || chat.created_at), end = new Date(chat.closed_at || Date.now());
     const mins = Math.max(0, Math.round((end - start) / 60000));
     const lines = msgs.map(m => `[${new Date(m.created_at).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', second: '2-digit' })}] ${m.sender === 'admin' ? 'Support' : chat.name}: ${m.text}`);
-    return `Live-Support-Gespräch #${chat.id}\nSpieler: ${chat.name} (Commander #${chat.commander_id})\nThema: ${chat.topic}\nBeginn: ${liveSupportBerlin(start)}\nDauer: ${mins} Min.\nBeendet von: ${closedBy}\nBearbeiter: ${chat.admin_commander_id ? 'Commander #' + chat.admin_commander_id : '-'}\n\n` + (lines.length ? lines.join('\n') : '(keine Nachrichten)');
+    return `Live-Support-Gespräch #${chat.id}\nSpieler: ${chat.name} (Commander #${chat.commander_id})${chat.unverified ? ' [E-Mail nicht bestätigt]' : ''}\nThema: ${chat.topic}\nBeginn: ${liveSupportBerlin(start)}\nDauer: ${mins} Min.\nBeendet von: ${closedBy}\nBearbeiter: ${chat.admin_commander_id ? 'Commander #' + chat.admin_commander_id : '-'}\n\n` + (lines.length ? lines.join('\n') : '(keine Nachrichten)');
 }
 
 // Beendet ein Gespraech (nur wenn noch offen) und verschickt das Protokoll. Gibt die Zeile zurueck oder null, wenn es schon beendet war.
@@ -4377,7 +4379,7 @@ async function liveSupportStart(req, res) {
     return caller;
 }
 function liveSupportPublic(c) {
-    return { id: c.id, name: c.name, topic: c.topic, status: c.status, commanderId: c.commander_id, adminCommanderId: c.admin_commander_id || 0, createdAt: c.created_at, startedAt: c.started_at, closedAt: c.closed_at };
+    return { id: c.id, name: c.name, topic: c.topic, status: c.status, commanderId: c.commander_id, unverified: !!c.unverified, adminCommanderId: c.admin_commander_id || 0, createdAt: c.created_at, startedAt: c.started_at, closedAt: c.closed_at };
 }
 // Darf dieser Aufrufer in diesem Gespraech lesen/schreiben? Spieler: nur das eigene; Admin: nur offene Gespraeche (lesen) bzw. das uebernommene (schreiben)
 function liveSupportMayRead(caller, chat) { return liveSupportIsAdmin(caller) || Number(chat.commander_id) === Number(caller.commanderId); }
@@ -4408,7 +4410,10 @@ app.post('/support/live/presence', async (req, res) => {
 
 app.post('/support/live/request', async (req, res) => {
     const caller = await liveSupportStart(req, res); if (!caller) return;
-    let topic = String((req.body && req.body.topic) || '').trim().slice(0, LIVE_SUPPORT_MAX_TEXT);
+    // 01.11.2026: ohne bestaetigte E-Mail darf man den Support trotzdem nutzen, aber mit strengerem Spamschutz (kuerzer, seltener, langsamer)
+    let unverified = false;
+    if (!liveSupportIsAdmin(caller) && EMAIL_GATE_ON) { try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; } }
+    let topic = String((req.body && req.body.topic) || '').trim().slice(0, unverified ? LIVE_SUPPORT_UNVERIFIED_MAX_TEXT : LIVE_SUPPORT_MAX_TEXT);
     if (!topic) return res.status(400).json({ success: false, error: 'Bitte beschreibe kurz, worum es geht.' });
     if (!liveSupportOnline()) return res.status(409).json({ success: false, code: 'SUPPORT_OFFLINE', error: 'Gerade ist niemand vom Support erreichbar. Bitte nutze das Support-Formular.' });
     let topicMasked = false;   // 01.11.2026: Beleidigungen werden maskiert ("Ar******h") statt abgelehnt
@@ -4418,10 +4423,10 @@ app.post('/support/live/request', async (req, res) => {
             return res.status(403).json({ success: false, code: 'EMAIL_UNVERIFIED', error: 'Für den Live-Support brauchst du eine bestätigte E-Mail-Adresse. Bis dahin hilft dir das Support-Formular.' });
         const open = await pool.query(`SELECT id FROM support_chats WHERE commander_id = $1 AND status <> 'closed' LIMIT 1`, [caller.commanderId]);
         if (open.rows.length) return res.status(409).json({ success: false, error: 'Du hast schon eine offene Anfrage.' });
-        if (rateLimited('livereqgap|' + caller.playFabId, 1, 120000)) return res.status(429).json({ success: false, error: 'Bitte warte ein paar Minuten, bevor du eine neue Anfrage stellst.' });
-        if (rateLimited('livereqday|' + caller.playFabId, 5, 86400000)) return res.status(429).json({ success: false, error: 'Du hast heute schon mehrere Anfragen gestellt. Bitte versuche es morgen wieder.' });
+        if (rateLimited('livereqgap|' + caller.playFabId, 1, unverified ? LIVE_SUPPORT_UNVERIFIED_REQ_GAP_MS : 120000)) return res.status(429).json({ success: false, error: 'Bitte warte ein paar Minuten, bevor du eine neue Anfrage stellst.' });
+        if (rateLimited('livereqday|' + caller.playFabId, unverified ? LIVE_SUPPORT_UNVERIFIED_REQ_PER_DAY : 5, 86400000)) return res.status(429).json({ success: false, error: 'Du hast heute schon mehrere Anfragen gestellt. Bitte versuche es morgen wieder.' });
         const prof = await verifiedProfile(caller, req.body && req.body.name, null);
-        const r = await pool.query(`INSERT INTO support_chats (commander_id, pfid, name, topic, status) VALUES ($1, $2, $3, $4, 'waiting') RETURNING *`, [caller.commanderId, caller.playFabId, prof.name, topic]);
+        const r = await pool.query(`INSERT INTO support_chats (commander_id, pfid, name, topic, status, unverified) VALUES ($1, $2, $3, $4, 'waiting', $5) RETURNING *`, [caller.commanderId, caller.playFabId, prof.name, topic, unverified]);
         const ahead = await pool.query(`SELECT COUNT(*)::int AS n FROM support_chats WHERE status = 'waiting' AND id < $1`, [r.rows[0].id]);
         res.json({ success: true, chat: liveSupportPublic(r.rows[0]), position: ahead.rows[0].n + 1, masked: topicMasked });
     } catch (e) { console.error('[LiveSupport] request:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
@@ -4474,9 +4479,11 @@ app.post('/support/live/:id/message', async (req, res) => {
         if (chat.status !== 'active') return res.status(409).json({ success: false, error: chat.status === 'waiting' ? 'Es hat noch niemand das Gespräch übernommen.' : 'Das Gespräch ist beendet.' });
         const isAdmin = liveSupportIsAdmin(caller);
         if (isAdmin && Number(chat.admin_commander_id) !== Number(caller.commanderId)) return res.status(403).json({ success: false, error: 'Dieses Gespräch führt ein anderer Admin.' });
+        const limitedPlayer = !!chat.unverified && !isAdmin;   // Gespraech eines Spielers ohne bestaetigte E-Mail: kuerzer und langsamer
+        if (limitedPlayer && text.length > LIVE_SUPPORT_UNVERIFIED_MAX_TEXT) return res.status(400).json({ success: false, error: `Ohne bestätigte E-Mail-Adresse sind nur kurze Nachrichten möglich (höchstens ${LIVE_SUPPORT_UNVERIFIED_MAX_TEXT} Zeichen).` });
         let masked = false;   // 01.11.2026: Spieler-Nachrichten werden maskiert statt abgelehnt (Admin ausgenommen)
         if (!isAdmin) { const wf = wordFilterMask(text); if (wf.hits > 0) { text = wf.text; masked = true; } }
-        if (rateLimited('livemsg|' + caller.playFabId + '|' + id, 1, 1000)) return res.status(429).json({ success: false, error: 'Bitte etwas langsamer.' });
+        if (rateLimited('livemsg|' + caller.playFabId + '|' + id, 1, limitedPlayer ? LIVE_SUPPORT_UNVERIFIED_MSG_GAP_MS : 1000)) return res.status(429).json({ success: false, error: 'Bitte etwas langsamer.' });
         const m = await pool.query(`INSERT INTO support_chat_messages (chat_id, sender, text) VALUES ($1, $2, $3) RETURNING id`, [id, isAdmin ? 'admin' : 'player', text]);
         await pool.query('UPDATE support_chats SET last_msg_at = now() WHERE id = $1', [id]);
         res.json({ success: true, id: m.rows[0].id, masked });
