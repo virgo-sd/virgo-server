@@ -556,6 +556,9 @@ function wordFilterMask(text) {
 }
 // WORTFILTER-ENDE
 
+// NEU 01.11.2026: Der Admin-Schluessel darf im Header X-Admin-Key geschickt werden (landet dann nicht in Adresszeilen/Logs); ?key= bleibt aus Kompatibilitaet erlaubt.
+function adminKeyFrom(req) { return req.get('X-Admin-Key') || (req.query && req.query.key); }
+
 function adminKeyOk(provided) {
     const expected = process.env.ADMIN_KEY;
     if (!expected || typeof provided !== 'string') return false;
@@ -1826,7 +1829,7 @@ app.post('/saveReport', async (req, res) => {
 // wie /admin/reports weiter unten (bereits vorhandene ADMIN_KEY-
 // Umgebungsvariable, keine neue nötig).
 function checkAdminKey(req, res) {
-    if (!adminKeyOk(req.query.key)) {
+    if (!adminKeyOk(adminKeyFrom(req))) {
         res.status(403).json({ success: false, error: 'Nicht autorisiert' });
         return false;
     }
@@ -4233,7 +4236,7 @@ app.get('/supportMessages', async (req, res) => {
 const SUPPORT_STATUSES = ['new', 'read', 'done'];
 const SUPPORT_REPLY_MAX = 1500;
 
-function supportKeyOk(req) { return adminKeyOk(req.get('X-Admin-Key') || req.query.key); }
+function supportKeyOk(req) { return adminKeyOk(adminKeyFrom(req)); }
 
 // Ingame-Mail "Support" in das Postfach eines Spielers legen. Wirft bei Fehlern (der Aufrufer meldet sie), im Gegensatz zu stationedMailTo.
 async function supportMailTo(commanderId, subject, body) {
@@ -5039,7 +5042,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
-    if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
     try {
         const wanted = typeof req.query.tables === 'string' && req.query.tables ? req.query.tables.split(',') : DB_EXPORT_TABLES;
         const tables = {}, counts = {};
@@ -5074,7 +5077,7 @@ app.get('/admin/db-export', async (req, res) => {
 // -------------------------------------------------------
 app.post('/admin/db-import', async (req, res) => {
     if (process.env.DB_IMPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
-    if (!adminKeyOk(req.query.key)) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
+    if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
     const dump = req.body;
     if (!dump || typeof dump.tables !== 'object') return res.status(400).json({ success: false, error: 'Keine Sicherung im Body.' });
     const result = {};
@@ -5126,7 +5129,7 @@ app.post('/admin/db-import', async (req, res) => {
 });
 
 app.get('/admin/reports', async (req, res) => {
-    if (!adminKeyOk(req.query.key)) {
+    if (!adminKeyOk(adminKeyFrom(req))) {
         return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
     }
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
