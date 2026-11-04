@@ -110,7 +110,7 @@ app.use((req, res, next) => (req.path === '/admin/db-import' ? importJsonParser(
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket, X-Client-Version');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, X-Session-Ticket, X-Client-Version, X-Lang');
     res.header('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
@@ -276,6 +276,19 @@ async function authCheckClaims(req, playFabId, group) {
     return null;
 }
 
+// NEU 04.11.2026 (Mehrsprachigkeit): Der Client schickt seine Sprache im Header X-Lang (de|en|fr). Wir merken sie je Konto in commander_highscore.lang
+// (Vorbereitung fuer sprachabhaengige Server-Mails und die spaetere Chat-Uebersetzung). Aenderung wird nur bei Wechsel geschrieben; Fehler sind egal.
+const langSeen = new Map();   // playFabId -> zuletzt gemerkte Sprache
+function noteLang(req, playFabId) {
+    try {
+        const l = String(req.get('X-Lang') || '').toLowerCase();
+        if (!/^(de|en|fr)$/.test(l) || langSeen.get(playFabId) === l) return;
+        if (langSeen.size > 5000) langSeen.clear();
+        langSeen.set(playFabId, l);
+        pool.query('UPDATE commander_highscore SET lang = $2 WHERE playfab_id = $1', [playFabId, l]).catch(() => { /* Spalte fehlt noch / DB kurz weg: unwichtig */ });
+    } catch (e) { /* nie blockieren */ }
+}
+
 app.use(async (req, res, next) => {
     if (AUTH_MODE === 'off' || req.method === 'OPTIONS') return next();
     const group = authGroupFor(req);
@@ -294,6 +307,7 @@ app.use(async (req, res, next) => {
                 problem = { reason: 'TICKET-UNGUELTIG' };
             } else {
                 req.auth.playFabId = playFabId;
+                noteLang(req, playFabId);   // 04.11.2026 (Mehrsprachigkeit): Sprache des Kontos merken (Header X-Lang), nie blockierend
                 problem = await authCheckClaims(req, playFabId, group);
             }
         }
@@ -963,6 +977,7 @@ async function initDatabase() {
             );
         `);
         await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS avatar_index INTEGER NOT NULL DEFAULT 0;`);
+        await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS lang TEXT;`);   // 04.11.2026: Sprache des Kontos (de|en|fr), siehe noteLang()
         await pool.query(`ALTER TABLE commander_highscore ADD COLUMN IF NOT EXISTS playfab_id TEXT;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_commander_highscore_points ON commander_highscore (total_points DESC);`);
 
