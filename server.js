@@ -9184,7 +9184,7 @@ const MARKET_SETTLE_DELAY_SECONDS = 15;
 // 1.000 Metalle (12 000) = 750 Wasserstoff (16) = 750 Werkzeuge (16) = 500 Energie (24) = 250 Credits (48).
 // Reihenfolge der Wertigkeit laut Nutzer: Credits > Energie > Wasserstoff/Werkzeuge > Metalle.
 const MARKET_VALUE_WEIGHT = [24, 16, 12, 16, 48];
-const MARKET_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC']; // wie ResourceNames.cs im Client
+const MARKET_RESOURCE_NAMES = ['Energie', 'H2', 'Metalle', 'Werkzeuge', 'ICC']; // wie ResourceNames.cs im Client
 
 // Baukosten (Ress01-05) der handelbaren Schiffe - MUSS manuell synchron mit den Unity-Assets gehalten werden
 // (Assets/Ship Assets/*.asset, Stand 04.10.2026), wie BUILDING_ECONOMY. Daraus wird der Warenwert berechnet.
@@ -9547,7 +9547,7 @@ app.post('/market/create', async (req, res) => {
 
     if (!coord) return marketFail(res, 400, 'Ungültige Kolonie.');
     if (!marketItemValid(kind, index)) return marketFail(res, 400, 'Diese Ware kann nicht gehandelt werden.');
-    if (!(priceResource >= 0 && priceResource <= 4)) return marketFail(res, 400, 'Als Gegenleistung sind nur Energie, Wasserstoff, Metalle, Werkzeuge und ICC erlaubt.');
+    if (!(priceResource >= 0 && priceResource <= 4)) return marketFail(res, 400, 'Als Gegenleistung sind nur Energie, H2, Metalle, Werkzeuge und ICC erlaubt.');
     if (kind === 'resource' && priceResource === index)
         return marketFail(res, 400, `${marketItemName('resource', index)} kann nicht gegen ${marketItemName('resource', index)} getauscht werden.`);
     const def = MARKET_KINDS[kind];
@@ -9870,7 +9870,7 @@ const INVENTORY_MAX_USE_QUANTITY = 999;       // so viele Kisten auf einmal oeff
 // Einheiten je Rohstoffkiste, Index = Ress-Index. MUSS zu CrateItems.CrateAmount (Client, CrateItems.cs) passen - ein Test vergleicht beide.
 const INVENTORY_CRATE_AMOUNTS    = [5000, 7500, 10000, 7500, 2500, 10000, 10000, 10000, 10000, 10000];
 // Namen wie in ResourceNames.cs (Client) - nur fuer Admin-Texte; der Client baut die Anzeigenamen selbst.
-const INVENTORY_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'VC'];   // 22.10.2026: Index 4 = ICC (Handelswaehrung), Index 9 = VC (Premium)
+const INVENTORY_RESOURCE_NAMES = ['Energie', 'H2', 'Metalle', 'Werkzeuge', 'ICC', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'VC'];   // 22.10.2026: Index 4 = ICC (Handelswaehrung), Index 9 = VC (Premium)
 const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premium-Waehrung, nie per "all"/Shop/Quest
 
 const INVENTORY_ITEMS = (() => {
@@ -10945,7 +10945,7 @@ app.post('/planet/terraform-abort', async (req, res) => {
 // #####################################################################
 
 const STATIONED_MAX_PER_PLANET = 10;
-const STATIONED_RESOURCE_NAMES = ['Energie', 'Wasserstoff', 'Metalle', 'Werkzeuge', 'ICC'];
+const STATIONED_RESOURCE_NAMES = ['Energie', 'H2', 'Metalle', 'Werkzeuge', 'ICC'];
 
 async function stationedLookupCommander(commanderId) {
     const r = await pool.query('SELECT playfab_id, commander_name FROM commander_highscore WHERE commander_id = $1', [commanderId]);
@@ -11989,7 +11989,7 @@ app.post('/alliance-treasury/deposit', async (req, res) => {
     const index  = marketStrictInt(req.body && req.body.resourceIndex);
     const amount = marketStrictInt(req.body && req.body.amount);
     if (!coord) return marketFail(res, 400, 'Bitte einen Planeten wählen.');
-    if (!(index >= 0 && index <= 4)) return marketFail(res, 400, 'In die Kasse können Energie, Wasserstoff, Metalle, Werkzeuge und ICC eingezahlt werden.');
+    if (!(index >= 0 && index <= 4)) return marketFail(res, 400, 'In die Kasse können Energie, H2, Metalle, Werkzeuge und ICC eingezahlt werden.');
     if (!(amount >= TREASURY_MIN_DEPOSIT[index] && amount <= TREASURY_MAX_DEPOSIT))
         return marketFail(res, 400, `Menge: mindestens ${marketNum(TREASURY_MIN_DEPOSIT[index])} ${MARKET_RESOURCE_NAMES[index]}.`);
 
