@@ -5394,6 +5394,30 @@ app.get('/dm/find', async (req, res) => {
         res.json({ success: true, matches: r.rows.filter(x => Number(x.commander_id) !== Number(caller.commanderId)).map(x => ({ id: Number(x.commander_id), name: cleanDisplayName(x.commander_name) })) });
     } catch (e) { console.error('[Privat] Suche:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
 });
+// NEU 07.11.2026 (Nutzerwunsch "Spieler suchen"): Treffer waehrend des Tippens. Ab 2 Zeichen Namensteil (Anfang zuerst, dann Teilstring) oder ab 3 Ziffern Anfang der Commander-ID;
+// hoechstens 8 Treffer mit Beziehungsfarbe und Allianz-Tag; nur echte Spieler (ID ab 1000000), nie man selbst.
+app.get('/dm/suggest', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const q = cleanDisplayName(req.query.q);
+    if (!q || (q.length < 2 && !/^\d+$/.test(q))) return res.json({ success: true, matches: [] });
+    if (rateLimited('dmsuggest|' + caller.playFabId, 120, 60000)) return dmFail(res, 429, 'Bitte langsamer suchen.');
+    const me = Number(caller.commanderId);
+    try {
+        const digits = q.replace(/\s/g, '');
+        let rows;
+        if (/^\d{3,}$/.test(digits)) {
+            rows = (await pool.query('/* suggest-id */ SELECT commander_id, commander_name, avatar_index FROM commander_highscore WHERE commander_id >= 1000000 AND commander_id <> $2 AND commander_id::text LIKE $1 || \'%\' ORDER BY commander_id LIMIT 8', [digits, me])).rows;
+        } else if (/^\d+$/.test(digits)) {
+            return res.json({ success: true, matches: [] });
+        } else {
+            const esc = q.toLowerCase().replace(/[\\%_]/g, c => '\\' + c);
+            rows = (await pool.query('/* suggest-name */ SELECT commander_id, commander_name, avatar_index FROM commander_highscore WHERE commander_id >= 1000000 AND commander_id <> $2 AND lower(commander_name) LIKE \'%\' || $1 || \'%\' ORDER BY (lower(commander_name) LIKE $1 || \'%\') DESC, lower(commander_name), commander_id LIMIT 8', [esc, me])).rows;
+        }
+        const ids = rows.map(r => Number(r.commander_id));
+        const rels = ids.length ? await dmRelations(me, ids) : new Map();
+        res.json({ success: true, matches: rows.map(r => { const id = Number(r.commander_id), rl = rels.get(id) || { rel: 'none', tag: '' }; return { id, name: cleanDisplayName(r.commander_name), avatar: r.avatar_index || 0, tag: rl.tag, rel: rl.rel }; }) });
+    } catch (e) { console.error('[Privat] Vorschlaege:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
 // PRIVAT53-ENDE
 
 // #####################################################################
