@@ -4798,7 +4798,7 @@ app.get('/alliances/:id/chat', async (req, res) => {
         const r = since > 0
             ? await pool.query('SELECT ' + cols + from + ' AND c.id > $2 ORDER BY c.id ASC LIMIT 200', [id, since])
             : await pool.query('SELECT * FROM (SELECT ' + cols + from + ' ORDER BY c.id DESC LIMIT 100) t ORDER BY t.id ASC', [id]);
-        res.json({ success: true, chatEnabled: true, isFounder: st.isFounder, allMutedUntil: st.allMutedUntil, youMutedUntil: st.youMutedUntil, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, ref: m.ref || '' })) });
+        res.json({ success: true, chatEnabled: true, isFounder: st.isFounder, allMutedUntil: st.allMutedUntil, youMutedUntil: st.youMutedUntil, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, offerRef: m.ref || '' })) });
     } catch (e) { console.error('[Allianzchat] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
@@ -4823,8 +4823,8 @@ app.post('/alliances/:id/chat', async (req, res) => {
         let masked = false;
         const wf = wordFilterMask(text);
         if (wf.hits > 0) { text = wf.text; masked = true; }
-        const offerRef = await chatOfferRef(req.body && req.body.ref, caller.commanderId);   // NEU 07.11.2026 (Anwerben)
-        if (req.body && req.body.ref && !offerRef.ref) return res.status(400).json({ success: false, error: offerRef.error || 'Ungültiger Verweis.' });
+        const offerRef = await chatOfferRef(req.body && req.body.offerRef, caller.commanderId);   // NEU 07.11.2026 (Anwerben)
+        if (req.body && req.body.offerRef && !offerRef.ref) return res.status(400).json({ success: false, error: offerRef.error || 'Ungültiger Verweis.' });
         const prof = await verifiedProfile(caller, null, null);
         const r = await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind, unverified, ref) VALUES ($1, $2, $3, $4, 'msg', $5, $6) RETURNING id",
             [id, caller.commanderId, prof.name, text, unverified, offerRef.ref || null]);
@@ -5344,7 +5344,7 @@ app.get('/dm/with/:otherId', async (req, res) => {
         const rl = (await dmRelations(me, [other])).get(other) || { rel: 'none', tag: '' };
         const blocked = (await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [me, other])).rows.length > 0;
         res.json({ success: true, partner: { id: other, name: nm ? cleanDisplayName(nm.commander_name) : ('Commander ' + other), avatar: nm ? (nm.avatar_index || 0) : 0, tag: rl.tag, rel: rl.rel, blocked, exists: !!nm },
-            messages: msgs.rows.map(m => ({ id: String(m.id), senderId: Number(m.sender_id), text: m.kind === 'deleted' ? '' : m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, ref: m.kind === 'deleted' ? '' : (m.ref || '') })) });
+            messages: msgs.rows.map(m => ({ id: String(m.id), senderId: Number(m.sender_id), text: m.kind === 'deleted' ? '' : m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, offerRef: m.kind === 'deleted' ? '' : (m.ref || '') })) });
     } catch (e) { console.error('[Privat] Verlauf:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
 });
 
@@ -5385,8 +5385,8 @@ app.post('/dm/send', async (req, res) => {
         let masked = false;
         const wf = wordFilterMask(text);
         if (wf.hits > 0) { text = wf.text; masked = true; }
-        const offerRef = await chatOfferRef(req.body && req.body.ref, me);   // NEU 07.11.2026 (Anwerben)
-        if (req.body && req.body.ref && !offerRef.ref) return dmFail(res, 400, offerRef.error || 'Ungültiger Verweis.');
+        const offerRef = await chatOfferRef(req.body && req.body.offerRef, me);   // NEU 07.11.2026 (Anwerben)
+        if (req.body && req.body.offerRef && !offerRef.ref) return dmFail(res, 400, offerRef.error || 'Ungültiger Verweis.');
         const r = await pool.query("INSERT INTO dm_messages (sender_id, recipient_id, text, kind, unverified, ref) VALUES ($1, $2, $3, 'msg', $4, $5) RETURNING id, created_at", [me, other, text, unverified, offerRef.ref || null]);
         res.json({ success: true, id: String(r.rows[0].id), createdAt: r.rows[0].created_at, masked, text });
     } catch (e) { console.error('[Privat] senden:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
