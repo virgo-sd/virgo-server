@@ -169,6 +169,7 @@ const AUTH_POLICY = [
     ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
     ['*',    /^\/admin\/galaxy\/.+/,          'admin'],    // NEU 18.10.2026 (§30)
     ['*',    /^\/alliances\/admin\/.+/,        'admin'],
+    ['POST', /^\/alliances\/\d+\/chat\/\d+\/delete$/, 'admin'],   // NEU 07.11.2026 (§51): Admin loescht eine Allianzchat-Zeile
     ['PUT',  /^\/legal-texts\/.+/,             'admin'],
     ['GET',  /^\/supportMessages$/,            'admin'],
     ['POST', /^\/announcements$/,              'admin'],
@@ -1050,6 +1051,7 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE, sender_commander_id INTEGER, sender_name TEXT NOT NULL DEFAULT '',
             text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);   // NEU 07.11.2026 (§51): gewaehlte Sprache je Konto (gilt auf jedem Geraet)
 
         // -------------------------------------------------------
         // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
@@ -4780,6 +4782,66 @@ app.post('/support/inbox/form/:id/done', async (req, res) => {
 // MELDEN50-ENDE
 
 // #####################################################################
+// §51  SPRACHE JE KONTO, ALLIANZCHAT-MODERATION, AUFBEWAHRUNG (07.11.2026, Nutzer-Entscheidungen)
+//      Sprache: wer sie einmal im Spiel gewaehlt hat, findet sie auf jedem Geraet wieder (Client fragt nach dem Login: GET /account/language,
+//      speichert bei bewusster Wahl: POST /account/language). Der X-Lang-Header (noteLang) bleibt nur Statistik und ueberschreibt NICHTS davon.
+//      Moderation: Admin loescht eine Allianzchat-Zeile (POST /alliances/:id/chat/:msgId/delete). Zeile wird entfernt und durch eine unsichtbare
+//      Marke (kind 'delete', text = Nummer der entfernten Zeile) ersetzt, damit auch schon geladene Clients sie ausblenden.
+//      Aufbewahrung: Support-Formulare und Spielermeldungen werden 6 Monate nach dem Eingang geloescht, sofern erledigt/gelesen (neue 12 Monate).
+// #####################################################################
+// SPRACHE51-START
+const ACCOUNT_LANGS = ['de', 'en'];
+const RETENTION_DONE_DAYS = 180, RETENTION_NEW_DAYS = 365;
+
+app.get('/account/language', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    try {
+        const r = await pool.query('SELECT lang FROM account_language WHERE commander_id = $1', [caller.commanderId]);
+        res.json({ success: true, lang: r.rows.length ? r.rows[0].lang : '' });
+    } catch (e) { console.error('[Sprache] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/account/language', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const lang = String((req.body && req.body.lang) || '').toLowerCase();
+    if (!ACCOUNT_LANGS.includes(lang)) return res.status(400).json({ success: false, error: 'Ungültige Sprache.' });
+    try {
+        await pool.query('INSERT INTO account_language (commander_id, lang, updated_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id) DO UPDATE SET lang = EXCLUDED.lang, updated_at = now()', [caller.commanderId, lang]);
+        res.json({ success: true, lang });
+    } catch (e) { console.error('[Sprache] speichern:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/alliances/:id/chat/:msgId/delete', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return res.status(403).json({ success: false, error: 'Nur für Administratoren.' });
+    const id = parseInt(req.params.id, 10), msgId = parseInt(req.params.msgId, 10);
+    if (!id || !msgId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    try {
+        const d = await pool.query("DELETE FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND kind <> 'delete'", [msgId, id]);
+        if (!d.rowCount) return res.status(404).json({ success: false, error: 'Zeile nicht gefunden.' });
+        await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind) VALUES ($1, NULL, '', $2, 'delete')", [id, String(msgId)]);
+        await allianceChatTrim(id);
+        console.log('[Allianzchat] Zeile durch Admin entfernt');
+        res.json({ success: true });
+    } catch (e) { console.error('[Allianzchat] loeschen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// Aufbewahrungsfristen (Datenschutz-Seite: 6 Monate). Laeuft 3 Minuten nach dem Start und danach alle 6 Stunden; Fehler nie fatal.
+async function retentionMaintain() {
+    try {
+        const a = await pool.query("DELETE FROM support_messages WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
+        const b = await pool.query("DELETE FROM player_reports WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
+        if (a.rowCount || b.rowCount) console.log('[Aufbewahrung] gelöscht: Support-Nachrichten ' + a.rowCount + ', Meldungen ' + b.rowCount);
+        return { messages: a.rowCount, reports: b.rowCount };
+    } catch (e) { console.error('[Aufbewahrung] Fehler:', e.message); return null; }
+}
+if (typeof setTimeout === 'function' && process.env.NODE_ENV !== 'test') {
+    const t1 = setTimeout(() => { retentionMaintain(); const t2 = setInterval(retentionMaintain, 6 * 3600 * 1000); if (t2.unref) t2.unref(); }, 3 * 60 * 1000);
+    if (t1.unref) t1.unref();
+}
+// SPRACHE51-ENDE
+
+// #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
 // #####################################################################
 
@@ -5241,7 +5303,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -7731,6 +7793,7 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             // NEU 01.11.2026 (§50): Blockierliste (eigene Eintraege und Eintraege ueber diesen Spieler) loeschen
             const blockRows = await client.query('DELETE FROM player_blocks WHERE blocker_commander_id = $1 OR blocked_commander_id = $1', [commanderId]);
             summary.blocksDeleted = blockRows.rowCount;
+            await client.query('DELETE FROM account_language WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§51)
         }
 
         const highscore = await client.query(
