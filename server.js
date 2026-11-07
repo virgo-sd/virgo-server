@@ -220,6 +220,7 @@ const pfGate = { inflight: 0, throttledUntil: 0, q: { high: [], normal: [], low:
 
 function pfDefaultPrio(endpoint, data) {
     if (endpoint === '/Server/AuthenticateSessionTicket') return 'high';
+    if (endpoint === '/Server/LoginWithServerCustomId') return 'high';   // NEU 07.11.2026: "Angemeldet bleiben" ist eine Anmeldung und muss bei Engpaessen vor den Hintergrundaufrufen drankommen
     const d = data || {};
     if (endpoint === '/Server/GetUserInternalData' && Array.isArray(d.Keys) && d.Keys.includes('commanderId')) return 'high';
     if ((endpoint === '/Server/GetTitleInternalData' || endpoint === '/Server/SetTitleInternalData') && (d.Key === 'NextCommanderId' || (Array.isArray(d.Keys) && d.Keys.includes('NextCommanderId')))) return 'high';
