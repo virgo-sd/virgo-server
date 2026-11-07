@@ -54,6 +54,8 @@
 //  §25  KAMPF V2 (Rundenkampf, Mischbonus, Zivile in letzter Reihe): steht VOR §21; aktiv nur bei COMBAT_ENGINE=shadow|v2
 //  §26  GALAXIE-REGISTER (planet_registry): serverautoritative Belegung, Schritt 1 (nur lesen/befuellen); steht VOR §21
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
+//  §53  PRIVATNACHRICHTEN (dm_messages/dm_reads, GET /dm/conversations|with|unread|find, POST /dm/send|delete; Beziehungsfarbe, Spamschutz); steht VOR §11
+//  §54  AGI AITAN IM CHAT (agi_messages, GET /agi/messages, POST /agi/command; Begruessung, Krieg/Frieden/Buendnis, neue Sektoren); steht VOR §11
 //  §45  KONTO AENDERN: E-MAIL UND PASSWORT (POST /account/change-email, /account/password-link; verlangen das aktuelle Passwort); steht VOR §21
 //  §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword; Konto loeschen verlangt das Passwort, wenn ACCOUNT_DELETE_NEEDS_PASSWORD=true); steht VOR §21
 //  (§43 NEUES PASSWORT SETZEN wurde am 25.10.2026 wieder entfernt: Reset laeuft ueber PlayFabs Standard-Seite, Entscheidung B)
@@ -1053,6 +1055,12 @@ async function initDatabase() {
             text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        // NEU 07.11.2026 (§53/§54): Privatnachrichten, Lesemarken, AGI-Aitan-Nachrichten
+        await pool.query(`CREATE TABLE IF NOT EXISTS dm_messages (id BIGSERIAL PRIMARY KEY, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_dm_sender ON dm_messages (sender_id, id DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_messages (recipient_id, id DESC);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS dm_reads (commander_id INTEGER NOT NULL, other_id INTEGER NOT NULL, last_read_id BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (commander_id, other_id));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS agi_messages (id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, text_de TEXT NOT NULL, text_en TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         // NEU 07.11.2026 (§52): Stummschalten, Allianz-Chat-Einstellungen, Kontext-Protokoll, Verweis auf die gemeldete Chat-Zeile
         await pool.query(`CREATE TABLE IF NOT EXISTS chat_mutes (commander_id INTEGER PRIMARY KEY, until TIMESTAMPTZ NOT NULL, by_commander_id INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat_settings (alliance_id INTEGER PRIMARY KEY REFERENCES alliances(id) ON DELETE CASCADE, chat_enabled BOOLEAN NOT NULL DEFAULT true, muted_until TIMESTAMPTZ);`);
@@ -3594,6 +3602,7 @@ app.post('/alliance-relationships/declare-war', async (req, res) => {
     const [a, b] = orderIds(allianceId, targetAllianceId);
 
     try {
+        const prevWar = await pool.query('SELECT status FROM alliance_relationships WHERE alliance_id_a = $1 AND alliance_id_b = $2', [a, b]);   // NEU 07.11.2026 (§54): AGI meldet nur NEUE Kriege
         const result = await pool.query(
             `INSERT INTO alliance_relationships (alliance_id_a, alliance_id_b, status)
              VALUES ($1, $2, 'war')
@@ -3601,6 +3610,7 @@ app.post('/alliance-relationships/declare-war', async (req, res) => {
              RETURNING *`,
             [a, b]
         );
+        if (!(prevWar.rows[0] && prevWar.rows[0].status === 'war')) agiAllianceEvent('war', allianceId, targetAllianceId);
         res.json({ success: true, relationship: result.rows[0] });
     } catch (error) {
         console.error('[Server] alliance-relationships/declare-war Fehler:', error.message);
@@ -3621,11 +3631,13 @@ app.post('/alliance-relationships/declare-peace', async (req, res) => {
     const [a, b] = orderIds(allianceId, targetAllianceId);
 
     try {
+        const prevRel = await pool.query('SELECT status FROM alliance_relationships WHERE alliance_id_a = $1 AND alliance_id_b = $2', [a, b]);   // NEU 07.11.2026 (§54)
         const result = await pool.query(
             `UPDATE alliance_relationships SET status = 'neutral', established_at = now()
              WHERE alliance_id_a = $1 AND alliance_id_b = $2 RETURNING *`,
             [a, b]
         );
+        if (prevRel.rows[0] && prevRel.rows[0].status === 'war') agiAllianceEvent('peace', allianceId, targetAllianceId);
         res.json({ success: true, relationship: result.rows[0] || null });
     } catch (error) {
         console.error('[Server] alliance-relationships/declare-peace Fehler:', error.message);
@@ -3892,6 +3904,7 @@ app.post('/alliance-relationships/respond', async (req, res) => {
                  WHERE alliance_id_a = $1 AND alliance_id_b = $2 RETURNING *`,
                 [a, b, type]
             );
+            agiAllianceEvent(type, allianceId, targetAllianceId);   // NEU 07.11.2026 (§54): 'ally' oder 'nap'
             res.json({ success: true, relationship: result.rows[0] });
         } else {
             const result = await pool.query(
@@ -4837,8 +4850,16 @@ app.post('/alliances/:id/chat/:msgId/delete', async (req, res) => {
     const id = parseInt(req.params.id, 10), msgId = parseInt(req.params.msgId, 10);
     if (!id || !msgId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
     try {
+        // NEU 07.11.2026: Jeder Spieler darf seine EIGENE Zeile loeschen. Sie bleibt als Platzhalter (kind 'deleted') stehen; die Marke 's<Nummer>' sagt geladenen Clients, sie umzuwandeln.
+        const own = (await pool.query("SELECT sender_commander_id FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND kind = 'msg'", [msgId, id])).rows[0];
+        if (own && Number(own.sender_commander_id) === Number(caller.commanderId) && (await allianceChatIsMember(caller.commanderId, id))) {
+            await pool.query("UPDATE alliance_chat SET kind = 'deleted', text = '' WHERE id = $1 AND alliance_id = $2", [msgId, id]);
+            await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind) VALUES ($1, NULL, '', $2, 'delete')", [id, 's' + msgId]);
+            await allianceChatTrim(id);
+            return res.json({ success: true, own: true });
+        }
         if (!(await allianceCanModerate(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur der Allianzgründer.' });   // §52: Admin oder Gründer dieser Allianz
-        const d = await pool.query("DELETE FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND kind <> 'delete'", [msgId, id]);
+        const d = await pool.query("DELETE FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND kind NOT IN ('delete', 'deleted')", [msgId, id]);
         if (!d.rowCount) return res.status(404).json({ success: false, error: 'Zeile nicht gefunden.' });
         await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind) VALUES ($1, NULL, '', $2, 'delete')", [id, String(msgId)]);
         await allianceChatTrim(id);
@@ -4853,6 +4874,8 @@ async function retentionMaintain() {
         const a = await pool.query("DELETE FROM support_messages WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
         const b = await pool.query("DELETE FROM player_reports WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
         const c = await pool.query('DELETE FROM alliance_chat WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);
+        await pool.query('DELETE FROM dm_messages WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);   // NEU 07.11.2026 (§53)
+        await pool.query('DELETE FROM agi_messages WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);   // NEU 07.11.2026 (§54)
         await pool.query('DELETE FROM chat_mutes WHERE until < now()');
         await pool.query('DELETE FROM alliance_chat_mutes WHERE until < now()');
         await pool.query('DELETE FROM report_context_log WHERE created_at < now() - $1::interval', [RETENTION_DONE_DAYS + ' days']);
@@ -5023,6 +5046,339 @@ app.post('/support/inbox/purge-done', async (req, res) => {
     } catch (e) { console.error('[Eingang] Aufraeumen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 // SCHUTZ52-ENDE
+
+// #####################################################################
+// §53  PRIVATNACHRICHTEN (07.11.2026, Nutzerwunsch "Privat-Tab ausbauen", Ziel: hunderte Commander)
+//      Eigene Postgres-Tabellen (dm_messages, dm_reads); die Unterhaltung ist nur fuer die beiden Beteiligten lesbar.
+//      Liste: neueste Unterhaltung zuerst, seitenweise (40 je Seite, "mehr laden"), mit ungelesen-Zaehler und Beziehungsfarbe (rel):
+//      war (Spielerkrieg oder Allianzkrieg) > friend > member (gleiche Allianz) > ally (verbuendete Allianz) > nap > none.
+//      Regeln: max. 200 Zeichen (ohne bestaetigte E-Mail "Unregistriert": 30 Zeichen, Abstand 15 s), Abstand 1,2 s, Wortfilter MASKIERT wie im Chat,
+//      Admin-Stummschaltung gilt (chat_mutes), Blockierte koennen nicht schreiben (und wer blockiert hat, nicht an den Blockierten),
+//      Spamschutz: nach 5 unbeantworteten Nachrichten an dieselbe Person ist Schluss, bis sie antwortet; hoechstens 20 NEUE Unterhaltungen je Stunde.
+//      Eigene Nachricht loeschen: Zeile bleibt als Platzhalter (kind 'deleted'), beide sehen "*** Name hat die Nachricht gelöscht ***".
+//      Aufbewahrung 90 Tage (retentionMaintain), bei Kontoloeschung werden alle Zeilen des Spielers (gesendet und empfangen) entfernt.
+// #####################################################################
+// PRIVAT53-START
+const DM_MAX_TEXT = 200, DM_UNVERIFIED_MAX = 30, DM_GAP_MS = 1200, DM_UNVERIFIED_GAP_MS = 15000;
+const DM_PAGE = 40, DM_THREAD_LIMIT = 100, DM_UNANSWERED_MAX = 5, DM_NEW_CONV_PER_HOUR = 20;
+
+function dmFail(res, code, error) { return res.status(code).json({ success: false, error }); }
+function dmCleanText(raw) { return String(raw == null ? '' : raw).replace(/[<>\u0000-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '').replace(/\s+/g, ' ').trim(); }
+
+// Beziehung zu mehreren Spielern auf einmal: Map(id -> { rel, tag })
+async function dmRelations(me, otherIds) {
+    const out = new Map();
+    if (!otherIds.length) return out;
+    const ids = otherIds.map(Number);
+    const all = ids.concat([Number(me)]);
+    const al = await pool.query('SELECT m.commander_id, m.alliance_id, a.tag FROM alliance_members m JOIN alliances a ON a.id = m.alliance_id WHERE m.commander_id = ANY($1::int[])', [all]);
+    const allianceOf = new Map(), tagOf = new Map();
+    al.rows.forEach(r => { allianceOf.set(Number(r.commander_id), Number(r.alliance_id)); tagOf.set(Number(r.commander_id), r.tag); });
+    const pr = await pool.query('SELECT commander_id_a, commander_id_b, status FROM player_relationships WHERE (commander_id_a = $1 AND commander_id_b = ANY($2::int[])) OR (commander_id_b = $1 AND commander_id_a = ANY($2::int[]))', [me, ids]);
+    const personal = new Map();
+    pr.rows.forEach(r => personal.set(Number(r.commander_id_a) === Number(me) ? Number(r.commander_id_b) : Number(r.commander_id_a), r.status));
+    const myAlliance = allianceOf.get(Number(me)) || 0;
+    const treaty = new Map();   // andere Allianz -> war|ally|nap
+    if (myAlliance) {
+        const ar = await pool.query("SELECT alliance_id_a, alliance_id_b, status FROM alliance_relationships WHERE (alliance_id_a = $1 OR alliance_id_b = $1) AND status IN ('war', 'ally', 'nap')", [myAlliance]);
+        ar.rows.forEach(r => treaty.set(Number(r.alliance_id_a) === myAlliance ? Number(r.alliance_id_b) : Number(r.alliance_id_a), r.status));
+    }
+    for (const id of ids) {
+        const p = personal.get(id), oa = allianceOf.get(id) || 0, t = oa ? treaty.get(oa) : undefined;
+        let rel = 'none';
+        if (p === 'war' || t === 'war') rel = 'war';
+        else if (p === 'friend') rel = 'friend';
+        else if (myAlliance && oa === myAlliance) rel = 'member';
+        else if (t === 'ally') rel = 'ally';
+        else if (t === 'nap') rel = 'nap';
+        out.set(id, { rel, tag: tagOf.get(id) || '' });
+    }
+    return out;
+}
+
+async function dmUnreadTotal(me) {
+    const r = await pool.query("SELECT COUNT(*)::int AS n FROM dm_messages m LEFT JOIN dm_reads d ON d.commander_id = $1 AND d.other_id = m.sender_id WHERE m.recipient_id = $1 AND m.kind = 'msg' AND m.id > COALESCE(d.last_read_id, 0)", [me]);
+    return r.rows[0].n;
+}
+
+app.get('/dm/unread', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    try { res.json({ success: true, unread: await dmUnreadTotal(Number(caller.commanderId)) }); }
+    catch (e) { console.error('[Privat] ungelesen:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.get('/dm/conversations', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const me = Number(caller.commanderId), offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    try {
+        const list = await pool.query('SELECT other, MAX(id) AS last_id FROM (SELECT recipient_id AS other, id FROM dm_messages WHERE sender_id = $1 UNION ALL SELECT sender_id AS other, id FROM dm_messages WHERE recipient_id = $1) t GROUP BY other ORDER BY last_id DESC OFFSET $2 LIMIT $3', [me, offset, DM_PAGE + 1]);
+        const hasMore = list.rows.length > DM_PAGE;
+        const rows = list.rows.slice(0, DM_PAGE);
+        const others = rows.map(r => Number(r.other));
+        const lastIds = rows.map(r => String(r.last_id));
+        let last = [], unread = [], names = [], rels = new Map();
+        if (rows.length) {
+            last = (await pool.query('SELECT id, sender_id, recipient_id, text, kind, created_at FROM dm_messages WHERE id = ANY($1::bigint[])', [lastIds])).rows;
+            unread = (await pool.query("SELECT m.sender_id AS other, COUNT(*)::int AS n FROM dm_messages m LEFT JOIN dm_reads d ON d.commander_id = $1 AND d.other_id = m.sender_id WHERE m.recipient_id = $1 AND m.sender_id = ANY($2::int[]) AND m.kind = 'msg' AND m.id > COALESCE(d.last_read_id, 0) GROUP BY m.sender_id", [me, others])).rows;
+            names = (await pool.query('SELECT commander_id, commander_name, avatar_index FROM commander_highscore WHERE commander_id = ANY($1::int[])', [others])).rows;
+            rels = await dmRelations(me, others);
+        }
+        const lastBy = new Map(last.map(m => [String(m.id), m]));
+        const unreadBy = new Map(unread.map(u => [Number(u.other), u.n]));
+        const nameBy = new Map(names.map(n => [Number(n.commander_id), n]));
+        const conversations = rows.map(r => {
+            const o = Number(r.other), m = lastBy.get(String(r.last_id)) || {}, n = nameBy.get(o), rl = rels.get(o) || { rel: 'none', tag: '' };
+            return { id: o, name: n ? cleanDisplayName(n.commander_name) : ('Commander ' + o), avatar: n ? (n.avatar_index || 0) : 0, tag: rl.tag, rel: rl.rel,
+                lastText: m.kind === 'deleted' ? '' : String(m.text || '').slice(0, 80), lastDeleted: m.kind === 'deleted', lastFromMe: Number(m.sender_id) === me, lastAt: m.created_at, unread: unreadBy.get(o) || 0 };
+        });
+        res.json({ success: true, conversations, hasMore, unread: offset === 0 ? await dmUnreadTotal(me) : undefined });
+    } catch (e) { console.error('[Privat] Liste:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.get('/dm/with/:otherId', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const me = Number(caller.commanderId), other = parseInt(req.params.otherId, 10);
+    if (!other || other < 1000000 || other === me) return dmFail(res, 400, 'Ungültiger Spieler.');
+    try {
+        const nm = (await pool.query('SELECT commander_name, avatar_index FROM commander_highscore WHERE commander_id = $1', [other])).rows[0];
+        const msgs = await pool.query('SELECT * FROM (SELECT id, sender_id, text, kind, unverified, created_at FROM dm_messages WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) ORDER BY id DESC LIMIT $3) t ORDER BY id ASC', [me, other, DM_THREAD_LIMIT]);
+        const incoming = msgs.rows.filter(m => Number(m.sender_id) === other).reduce((mx, m) => Math.max(mx, Number(m.id)), 0);
+        if (incoming > 0 && req.query.mark !== '0')
+            await pool.query('INSERT INTO dm_reads (commander_id, other_id, last_read_id) VALUES ($1, $2, $3) ON CONFLICT (commander_id, other_id) DO UPDATE SET last_read_id = GREATEST(dm_reads.last_read_id, EXCLUDED.last_read_id)', [me, other, incoming]);
+        const rl = (await dmRelations(me, [other])).get(other) || { rel: 'none', tag: '' };
+        const blocked = (await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [me, other])).rows.length > 0;
+        res.json({ success: true, partner: { id: other, name: nm ? cleanDisplayName(nm.commander_name) : ('Commander ' + other), avatar: nm ? (nm.avatar_index || 0) : 0, tag: rl.tag, rel: rl.rel, blocked, exists: !!nm },
+            messages: msgs.rows.map(m => ({ id: String(m.id), senderId: Number(m.sender_id), text: m.kind === 'deleted' ? '' : m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+    } catch (e) { console.error('[Privat] Verlauf:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.post('/dm/send', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const me = Number(caller.commanderId), other = parseInt(req.body && req.body.recipientId, 10);
+    let text = dmCleanText(req.body && req.body.text);
+    if (!other || other < 1000000 || other === me) return dmFail(res, 400, 'Ungültiger Empfänger.');
+    if (!text) return dmFail(res, 400, 'Nachricht fehlt.');
+    if (text.length > DM_MAX_TEXT) return dmFail(res, 400, 'Nachricht zu lang (höchstens ' + DM_MAX_TEXT + ' Zeichen).');
+    try {
+        const isAdmin = ADMIN_COMMANDER_IDS.includes(me);
+        const nm = (await pool.query('SELECT commander_name FROM commander_highscore WHERE commander_id = $1', [other])).rows[0];
+        if (!nm) return dmFail(res, 404, 'Diesen Spieler gibt es nicht.');
+        if (!isAdmin) {
+            const mute = await pool.query('SELECT until FROM chat_mutes WHERE commander_id = $1 AND until > now()', [me]);
+            if (mute.rows.length) return dmFail(res, 403, 'Du wurdest vom Support stummgeschaltet.' + muteUntilText(mute.rows[0].until));
+            const theyBlocked = await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [other, me]);
+            if (theyBlocked.rows.length) return dmFail(res, 403, 'Dieser Spieler möchte keine Nachrichten von dir erhalten.');
+        }
+        const iBlocked = await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [me, other]);
+        if (iBlocked.rows.length) return dmFail(res, 400, 'Du hast diesen Spieler blockiert. Hebe die Blockierung auf, um ihm zu schreiben.');
+        let unverified = false;
+        if (EMAIL_GATE_ON && !isAdmin) {
+            try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; }
+        }
+        if (unverified && text.length > DM_UNVERIFIED_MAX)
+            return dmFail(res, 400, 'Ohne bestätigte E-Mail-Adresse sind nur kurze Nachrichten möglich (höchstens ' + DM_UNVERIFIED_MAX + ' Zeichen).');
+        if (rateLimited('dmgap|' + caller.playFabId, 1, unverified ? DM_UNVERIFIED_GAP_MS : DM_GAP_MS))
+            return dmFail(res, 429, unverified ? 'Ohne bestätigte E-Mail-Adresse kannst du nur alle ' + (DM_UNVERIFIED_GAP_MS / 1000) + ' Sekunden schreiben.' : 'Bitte nicht so schnell schreiben.');
+        if (!isAdmin) {
+            const pend = await pool.query("SELECT COUNT(*)::int AS n FROM dm_messages WHERE sender_id = $1 AND recipient_id = $2 AND kind = 'msg' AND id > COALESCE((SELECT MAX(id) FROM dm_messages WHERE sender_id = $2 AND recipient_id = $1), 0)", [me, other]);
+            if (pend.rows[0].n >= DM_UNANSWERED_MAX) return dmFail(res, 429, 'Dein Gegenüber hat noch nicht geantwortet. Bitte warte auf eine Antwort, bevor du weiter schreibst.');
+            const known = await pool.query('SELECT 1 FROM dm_messages WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) LIMIT 1', [me, other]);
+            if (!known.rows.length && rateLimited('dmnew|' + caller.playFabId, DM_NEW_CONV_PER_HOUR, 3600000))
+                return dmFail(res, 429, 'Du hast in der letzten Stunde schon mit vielen neuen Spielern Kontakt aufgenommen. Bitte später wieder.');
+        }
+        let masked = false;
+        const wf = wordFilterMask(text);
+        if (wf.hits > 0) { text = wf.text; masked = true; }
+        const r = await pool.query("INSERT INTO dm_messages (sender_id, recipient_id, text, kind, unverified) VALUES ($1, $2, $3, 'msg', $4) RETURNING id, created_at", [me, other, text, unverified]);
+        res.json({ success: true, id: String(r.rows[0].id), createdAt: r.rows[0].created_at, masked, text });
+    } catch (e) { console.error('[Privat] senden:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+// Eigene Nachricht loeschen: bleibt als Platzhalter stehen (beide sehen "*** Name hat die Nachricht gelöscht ***")
+app.post('/dm/delete', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const me = Number(caller.commanderId), id = String(req.body && req.body.id || '');
+    if (!/^\d{1,18}$/.test(id)) return dmFail(res, 400, 'Ungültige Nachricht.');
+    try {
+        const r = await pool.query("UPDATE dm_messages SET kind = 'deleted', text = '' WHERE id = $1 AND sender_id = $2 AND kind = 'msg'", [id, me]);
+        if (!r.rowCount) return dmFail(res, 404, 'Nachricht nicht gefunden.');
+        res.json({ success: true });
+    } catch (e) { console.error('[Privat] loeschen:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+// Spieler suchen (fuer "Neue Nachricht"): Commander-ID oder genauer Name (ohne Beachtung der Gross-/Kleinschreibung), hoechstens 5 Treffer
+app.get('/dm/find', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const q = cleanDisplayName(req.query.q);
+    if (!q) return dmFail(res, 400, 'Suchtext fehlt.');
+    if (rateLimited('dmfind|' + caller.playFabId, 20, 60000)) return dmFail(res, 429, 'Bitte langsamer suchen.');
+    try {
+        const num = parseInt(q.replace(/[^0-9]/g, ''), 10);
+        const r = /^\d{7,}$/.test(q.replace(/\s/g, '')) && num >= 1000000
+            ? await pool.query('SELECT commander_id, commander_name FROM commander_highscore WHERE commander_id = $1', [num])
+            : await pool.query('SELECT commander_id, commander_name FROM commander_highscore WHERE lower(commander_name) = lower($1) ORDER BY commander_id LIMIT 5', [q]);
+        res.json({ success: true, matches: r.rows.filter(x => Number(x.commander_id) !== Number(caller.commanderId)).map(x => ({ id: Number(x.commander_id), name: cleanDisplayName(x.commander_name) })) });
+    } catch (e) { console.error('[Privat] Suche:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
+});
+// PRIVAT53-ENDE
+
+// #####################################################################
+// §54  AGI AITAN IM CHAT (07.11.2026, Nutzerwunsch): die KI des Virgo-Haufens schreibt fuer ALLE sichtbar und dauerhaft gespeichert in den
+//      Globalen Chat (Tabelle agi_messages, 90 Tage). Jede Zeile gibt es auf Deutsch UND Englisch (text_de/text_en); der Client zeigt die Sprache
+//      des Spielers. Anlaesse: neue Commander (gesammelt, hoechstens eine Begruessung je Minute), Kriegserklaerung / Friedensschluss / Buendnis /
+//      Nichtangriffspakt zwischen Allianzen, neu geoeffnete Sektoren, und Befehle (!agi help | time | serverstats | playerstats <ID> | top | wars | sectors).
+//      Befehle sind sprachneutral ("!agi time" oder kurz "!time"); der Client ruft POST /agi/command nur bei den eigenen Chat-Nachrichten auf.
+// #####################################################################
+// AGI54-START
+const AGI_KEEP = 300, AGI_COMMANDS = ['help', 'time', 'serverstats', 'playerstats', 'top', 'wars', 'sectors'];
+const AGI_ALIASES = { hilfe: 'help', zeit: 'time', stats: 'serverstats', spieler: 'playerstats', ranking: 'top', krieg: 'wars', kriege: 'wars', sektoren: 'sectors' };
+
+async function agiPost(kind, de, en) {
+    try {
+        await pool.query('INSERT INTO agi_messages (kind, text_de, text_en) VALUES ($1, $2, $3)', [kind, String(de).slice(0, 300), String(en).slice(0, 300)]);
+        await pool.query('DELETE FROM agi_messages WHERE id NOT IN (SELECT id FROM agi_messages ORDER BY id DESC LIMIT $1)', [AGI_KEEP]);
+    } catch (e) { console.error('[AGI] schreiben fehlgeschlagen:', e.message); }
+}
+const agiClean = s => cleanDisplayName(s).replace(/[\[\]]/g, '');
+
+// ---- neue Commander begruessen (gesammelt) ----
+const agiWelcomeQueue = [];
+function agiQueueWelcome(commanderId, name) {
+    if (!(commanderId >= 1000000)) return;
+    if (agiWelcomeQueue.length < 50) agiWelcomeQueue.push({ id: commanderId, name: agiClean(name) || ('Commander' + commanderId) });
+}
+async function agiFlushWelcome() {
+    if (!agiWelcomeQueue.length) return;
+    const batch = agiWelcomeQueue.splice(0, agiWelcomeQueue.length);
+    const shown = batch.slice(0, 5).map(x => x.name + ' (ID ' + x.id + ')');
+    const more = batch.length - shown.length;
+    const list = shown.join(', ') + (more > 0 ? ' +' + more : '');
+    await agiPost('welcome',
+        'Willkommen an Bord, ' + list + '! Ich bin AGI Aitan, die KI des Virgo-Haufens. Tippe !agi help, wenn du wissen willst, was ich kann.',
+        'Welcome aboard, ' + list + '! I am AGI Aitan, the AI of the Virgo Cluster. Type !agi help to see what I can do.');
+}
+if (typeof setInterval === 'function' && process.env.NODE_ENV !== 'test') { const tw = setInterval(agiFlushWelcome, 60000); if (tw.unref) tw.unref(); }
+
+// ---- Allianz-Ereignisse (Krieg, Frieden, Buendnis, Pakt) ----
+const agiLastAlliance = new Map();
+async function agiAllianceEvent(kind, allianceId, otherId) {
+    try {
+        const key = kind + '|' + Math.min(allianceId, otherId) + '|' + Math.max(allianceId, otherId);
+        if (Date.now() - (agiLastAlliance.get(key) || 0) < 10 * 60 * 1000) return;   // dieselbe Meldung nicht oefter als alle 10 Minuten (Schutz vor Hin-und-her-Klicken)
+        agiLastAlliance.set(key, Date.now());
+        const r = await pool.query('SELECT id, name, tag FROM alliances WHERE id = ANY($1::int[])', [[allianceId, otherId]]);
+        const a = r.rows.find(x => Number(x.id) === Number(allianceId)), b = r.rows.find(x => Number(x.id) === Number(otherId));
+        if (!a || !b) return;
+        const A = '[' + agiClean(a.tag) + '] ' + agiClean(a.name), B = '[' + agiClean(b.tag) + '] ' + agiClean(b.name);
+        if (kind === 'war') await agiPost('war', 'ACHTUNG: Kriegserklärung! Die Allianz ' + A + ' hat der Allianz ' + B + ' den Krieg erklärt.', 'ATTENTION: Declaration of war! The alliance ' + A + ' has declared war on the alliance ' + B + '.');
+        else if (kind === 'peace') await agiPost('peace', 'Friedensschluss: Die Allianzen ' + A + ' und ' + B + ' haben ihren Krieg beendet.', 'Peace treaty: the alliances ' + A + ' and ' + B + ' have ended their war.');
+        else if (kind === 'ally') await agiPost('ally', 'Bündnis: Die Allianzen ' + A + ' und ' + B + ' sind jetzt verbündet.', 'Alliance pact: the alliances ' + A + ' and ' + B + ' are now allied.');
+        else if (kind === 'nap') await agiPost('nap', 'Nichtangriffspakt: Die Allianzen ' + A + ' und ' + B + ' haben einen Nichtangriffspakt geschlossen.', 'Non-aggression pact: the alliances ' + A + ' and ' + B + ' have signed a non-aggression pact.');
+    } catch (e) { console.error('[AGI] Allianz-Meldung fehlgeschlagen:', e.message); }
+}
+
+// ---- neue Sektoren ----
+async function agiSectorsOpened(opened) {
+    try {
+        if (!opened || !opened.length) return;
+        const ids = opened.map(x => x.id).join(' und '), idsEn = opened.map(x => x.id).join(' and ');
+        await agiPost('sectors', 'Neuland! Die Sektoren ' + ids + ' wurden geöffnet. Neue Systeme warten auf mutige Kolonisten.', 'New frontiers! Sectors ' + idsEn + ' have been opened. New systems await brave colonists.');
+    } catch (e) { console.error('[AGI] Sektor-Meldung fehlgeschlagen:', e.message); }
+}
+
+// ---- Nachrichten lesen ----
+app.get('/agi/messages', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const since = parseInt(req.query.since, 10) || 0;
+    try {
+        const r = since > 0
+            ? await pool.query('SELECT id, kind, text_de, text_en, created_at FROM agi_messages WHERE id > $1 AND created_at > now() - $2::interval ORDER BY id ASC LIMIT 100', [since, CHAT_RETENTION_DAYS + ' days'])
+            : await pool.query('SELECT * FROM (SELECT id, kind, text_de, text_en, created_at FROM agi_messages WHERE created_at > now() - $1::interval ORDER BY id DESC LIMIT 30) t ORDER BY id ASC', [CHAT_RETENTION_DAYS + ' days']);
+        res.json({ success: true, messages: r.rows.map(m => ({ id: Number(m.id), kind: m.kind, de: m.text_de, en: m.text_en, createdAt: m.created_at })) });
+    } catch (e) { console.error('[AGI] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// ---- Befehle ----
+function agiNormalizeCommand(raw) {
+    let c = String(raw || '').trim().toLowerCase().replace(/^!/, '').replace(/^agi[\s:]*/, '').trim();
+    const parts = c.split(/\s+/).filter(Boolean);
+    let word = (parts[0] || '').replace(/:$/, '');
+    if (AGI_ALIASES[word]) word = AGI_ALIASES[word];
+    let arg = parts.slice(1).join(' ');
+    // alte Schreibweise "playerstats:1000000"
+    const colon = /^([a-z]+):(.+)$/.exec(parts[0] || '');
+    if (colon) { word = AGI_ALIASES[colon[1]] || colon[1]; arg = colon[2] + (arg ? ' ' + arg : ''); }
+    return { word, arg: arg.trim() };
+}
+
+async function agiAnswer(word, arg, callerId) {
+    if (word === 'help') return ['Meine Befehle (Deutsch und Englisch gleich): !agi time · !agi serverstats · !agi playerstats <ID> · !agi top · !agi wars · !agi sectors',
+        'My commands (the same in German and English): !agi time · !agi serverstats · !agi playerstats <ID> · !agi top · !agi wars · !agi sectors'];
+    if (word === 'time') {
+        const p = getBerlinParts(new Date());
+        return ['Serverzeit: ' + p.day + '.' + p.month + '.' + p.year + ' ' + p.hour + ':' + p.minute + ' Uhr (Berlin).', 'Server time: ' + p.year + '-' + p.month + '-' + p.day + ' ' + p.hour + ':' + p.minute + ' (Berlin).'];
+    }
+    if (word === 'serverstats') {
+        const q = async sql => { try { return Number((await pool.query(sql)).rows[0].n) || 0; } catch (e) { return 0; } };
+        const players = await q('SELECT COUNT(*)::int AS n FROM commander_highscore');
+        const alliances = await q('SELECT COUNT(*)::int AS n FROM alliances');
+        const colonies = await q("SELECT COUNT(*)::int AS n FROM planet_registry WHERE kind = 'player'");
+        const pirates = await q("SELECT COUNT(*)::int AS n FROM planet_registry WHERE kind = 'pirate'");
+        const open = galaxyOpenSectorList().length;
+        return ['Serverstatistik: ' + players + ' Commander · ' + alliances + ' Allianzen · ' + colonies + ' Kolonien · ' + pirates + ' Piratenposten · ' + open + ' offene Sektoren.',
+            'Server statistics: ' + players + ' Commanders · ' + alliances + ' alliances · ' + colonies + ' colonies · ' + pirates + ' pirate outposts · ' + open + ' open sectors.'];
+    }
+    if (word === 'playerstats') {
+        let id = parseInt(String(arg).replace(/[^0-9]/g, ''), 10);
+        if (!id || id < 1000000) id = Number(callerId);
+        const r = (await pool.query('SELECT commander_id, commander_name, total_points, fleet_points, infrastructure_points, research_points FROM commander_highscore WHERE commander_id = $1', [id])).rows[0];
+        if (!r) return ['Diesen Commander kenne ich nicht.', 'I do not know that Commander.'];
+        const rank = Number((await pool.query('SELECT COUNT(*)::int + 1 AS n FROM commander_highscore WHERE total_points > $1', [r.total_points])).rows[0].n);
+        const col = Number((await pool.query("SELECT COUNT(*)::int AS n FROM planet_registry WHERE owner_commander_id = $1 AND kind = 'player'", [id])).rows[0].n) || 0;
+        const tag = (await pool.query('SELECT a.tag FROM alliance_members m JOIN alliances a ON a.id = m.alliance_id WHERE m.commander_id = $1', [id])).rows[0];
+        const name = agiClean(r.commander_name) + ' (ID ' + id + ')' + (tag ? ' [' + agiClean(tag.tag) + ']' : '');
+        return [name + ': Platz ' + rank + ' · ' + r.total_points + ' Punkte (Flotte ' + r.fleet_points + ', Infrastruktur ' + r.infrastructure_points + ', Forschung ' + r.research_points + ') · ' + col + ' Kolonien.',
+            name + ': rank ' + rank + ' · ' + r.total_points + ' points (fleet ' + r.fleet_points + ', infrastructure ' + r.infrastructure_points + ', research ' + r.research_points + ') · ' + col + ' colonies.'];
+    }
+    if (word === 'top') {
+        const t = (await pool.query('SELECT commander_id, commander_name, total_points FROM commander_highscore ORDER BY total_points DESC, commander_id ASC LIMIT 3')).rows;
+        if (!t.length) return ['Noch keine Rangliste.', 'No ranking yet.'];
+        const list = t.map((x, i) => (i + 1) + '. ' + agiClean(x.commander_name) + ' (ID ' + x.commander_id + ', ' + x.total_points + ')').join(' · ');
+        return ['Die Besten: ' + list, 'The best: ' + list];
+    }
+    if (word === 'wars') {
+        const w = (await pool.query("SELECT a.tag AS at, b.tag AS bt FROM alliance_relationships r JOIN alliances a ON a.id = r.alliance_id_a JOIN alliances b ON b.id = r.alliance_id_b WHERE r.status = 'war' ORDER BY r.established_at DESC LIMIT 5")).rows;
+        const pw = Number((await pool.query("SELECT COUNT(*)::int AS n FROM player_relationships WHERE status = 'war'")).rows[0].n) || 0;
+        if (!w.length) return ['Zwischen Allianzen herrscht Frieden. Kriege zwischen einzelnen Commandern: ' + pw + '.', 'There is peace between alliances. Wars between individual Commanders: ' + pw + '.'];
+        const list = w.map(x => '[' + agiClean(x.at) + '] gegen [' + agiClean(x.bt) + ']').join(' · ');
+        const listEn = w.map(x => '[' + agiClean(x.at) + '] vs [' + agiClean(x.bt) + ']').join(' · ');
+        return ['Allianzkriege: ' + list + ' · Kriege zwischen Commandern: ' + pw + '.', 'Alliance wars: ' + listEn + ' · Wars between Commanders: ' + pw + '.'];
+    }
+    if (word === 'sectors') {
+        const open = galaxyOpenSectorList().map(x => x.id).sort((a, b) => a - b);
+        const high = galaxyHighestOpen();
+        let cap = { free: 0, total: 0 };
+        try { cap = await galaxyStartCapacity(high); } catch (e) { /* ohne Zahl */ }
+        const range = open.length ? open[0] + '-' + open[open.length - 1] : String(high);
+        return ['Offene Sektoren: ' + range + '. Im Sektor ' + high + ' sind noch ' + cap.free + ' von ' + cap.total + ' Startplätzen frei.', 'Open sectors: ' + range + '. Sector ' + high + ' still has ' + cap.free + ' of ' + cap.total + ' start slots free.'];
+    }
+    return null;
+}
+
+app.post('/agi/command', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const { word, arg } = agiNormalizeCommand(req.body && req.body.command);
+    if (!AGI_COMMANDS.includes(word)) return res.status(400).json({ success: false, error: 'Unbekannter Befehl.' });
+    if (rateLimited('agicmd|' + caller.playFabId, 1, 6000) || rateLimited('agicmd|all', 15, 60000)) return res.status(429).json({ success: false, error: 'Bitte einen Moment warten.' });
+    try {
+        const ans = await agiAnswer(word, arg, caller.commanderId);
+        if (!ans) return res.status(400).json({ success: false, error: 'Unbekannter Befehl.' });
+        await agiPost('cmd', ans[0], ans[1]);
+        res.json({ success: true });
+    } catch (e) { console.error('[AGI] Befehl:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+// AGI54-ENDE
+
 
 // #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
@@ -5486,7 +5842,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -7847,7 +8203,7 @@ app.post('/assignCommanderId', async (req, res) => {
 
     try {
         const result = await runCommanderIdExclusive(() => assignCommanderIdFor(playFabId));
-        if (result.isNew) console.log(`[Commander] ID ${result.commanderId} vergeben`);
+        if (result.isNew) { console.log(`[Commander] ID ${result.commanderId} vergeben`); agiQueueWelcome(result.commanderId, 'Commander' + result.commanderId); }   // NEU 07.11.2026 (§54)
         res.json({
             success: true,
             commanderId: result.commanderId,
@@ -7978,6 +8334,9 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             summary.blocksDeleted = blockRows.rowCount;
             await client.query('DELETE FROM account_language WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§51)
             await client.query('DELETE FROM chat_mutes WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§52)
+            const dmRows = await client.query('DELETE FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1', [commanderId]);   // NEU 07.11.2026 (§53): Privatnachrichten (gesendet und empfangen)
+            summary.privateMessagesDeleted = dmRows.rowCount;
+            await client.query('DELETE FROM dm_reads WHERE commander_id = $1 OR other_id = $1', [commanderId]);
             await client.query('DELETE FROM alliance_chat_mutes WHERE commander_id = $1', [commanderId]);
         }
 
@@ -10754,6 +11113,7 @@ async function galaxyOpenSectors(count, reason, onlyIfHighest) {
     await galaxyLoadStructure();
     if (skipped) return [];
     console.log(`[Galaxie] Sektoren eroeffnet (${reason || 'manuell'}): ${opened.map(x => x.id + ' (' + x.systems + ' Systeme)').join(', ')}`);
+    agiSectorsOpened(opened);   // NEU 07.11.2026 (§54): AGI Aitan meldet es im Chat
     return opened;
 }
 
@@ -13781,6 +14141,7 @@ app.get('/account/export', async (req, res) => {
             tagesaufgaben_abgeholt:  await part('SELECT * FROM daily_quest_state WHERE commander_id = $1 ORDER BY claimed_at DESC', [id], 300),
             tagesaufgaben_ereignisse: await part('SELECT * FROM daily_events WHERE commander_id = $1 ORDER BY created_at DESC', [id], 300),
             planeten:                await part('SELECT * FROM planet_registry WHERE owner_commander_id = $1', [id]),
+            private_nachrichten:     await part('SELECT id, sender_id, recipient_id, text, kind, created_at FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1 ORDER BY id DESC', [id], 2000),
             geschenkkisten:          await part('SELECT * FROM giftbox_claims WHERE playfab_id = $1', [pf]),
             geraete_angemeldet_bleiben: await part('SELECT created_at, last_used_at, expires_at FROM remember_tokens WHERE playfab_id = $1 ORDER BY created_at DESC', [pf], 20)
         };
@@ -13802,7 +14163,7 @@ app.get('/account/export', async (req, res) => {
             highscore: 'Rangliste (Punkte)', beziehungen: 'Beziehungen zu anderen Spielern', allianz_mitgliedschaft: 'Allianz-Mitgliedschaft',
             allianz_bewerbungen: 'Allianz-Bewerbungen', allianzkasse_buchungen: 'Buchungen in der Allianzkasse', handel_angebote: 'Handelsangebote',
             transporte: 'Transporte', stationierte_flotten: 'Stationierte Flotten', kaempfe_uebersicht: 'Kämpfe (Übersicht)', piratenangriffe: 'Piratenangriffe',
-            erfolge: 'Erfolge', tagesaufgaben_abgeholt: 'Abgeholte Tagesaufgaben', tagesaufgaben_ereignisse: 'Tagesaufgaben-Ereignisse', planeten: 'Planeten',
+            erfolge: 'Erfolge', tagesaufgaben_abgeholt: 'Abgeholte Tagesaufgaben', tagesaufgaben_ereignisse: 'Tagesaufgaben-Ereignisse', planeten: 'Planeten', private_nachrichten: 'Private Nachrichten',
             geschenkkisten: 'Geschenkkisten', geraete_angemeldet_bleiben: 'Geräte mit "Angemeldet bleiben"'
         };
         const lines = ['DEINE GESPEICHERTEN DATEN', 'Stand: ' + out.erstellt_am.replace('T', ' ').slice(0, 16) + ' UTC', '',
