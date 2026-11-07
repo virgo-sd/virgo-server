@@ -1222,9 +1222,12 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE, sender_commander_id INTEGER, sender_name TEXT NOT NULL DEFAULT '',
             text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
+        // NEU 07.11.2026 (Anwerben): Angebots-Verweis (OFFER-<Trade-ID>) in Allianz- und Privatnachrichten (oeffentliche Chats haben report_id)
+        await pool.query(`ALTER TABLE alliance_chat ADD COLUMN IF NOT EXISTS ref TEXT;`);
         await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         // NEU 07.11.2026 (§53/§54): Privatnachrichten, Lesemarken, AGI-Aitan-Nachrichten
         await pool.query(`CREATE TABLE IF NOT EXISTS dm_messages (id BIGSERIAL PRIMARY KEY, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`ALTER TABLE dm_messages ADD COLUMN IF NOT EXISTS ref TEXT;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_dm_sender ON dm_messages (sender_id, id DESC);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_messages (recipient_id, id DESC);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS dm_reads (commander_id INTEGER NOT NULL, other_id INTEGER NOT NULL, last_read_id BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (commander_id, other_id));`);
@@ -1825,6 +1828,11 @@ async function initDatabase() {
             END $$;
         `);
         await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS price_resource INTEGER NOT NULL DEFAULT 4;`);
+        // NEU 07.11.2026 (Lieferzeit gekaufter Schiffe): Zielplanet des Kaeufers, Ankunftszeit, "schon geliefert" (alte Zeilen = geliefert)
+        await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS buyer_coord TEXT;`);
+        await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS deliver_at TIMESTAMPTZ;`);
+        await pool.query(`ALTER TABLE market_offers ADD COLUMN IF NOT EXISTS delivered BOOLEAN NOT NULL DEFAULT true;`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_delivery ON market_offers (buyer_commander_id) WHERE delivered = false;`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_open ON market_offers (status, expires_at);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_seller ON market_offers (seller_commander_id, created_at DESC);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_market_offers_buyer ON market_offers (buyer_commander_id, sold_at DESC);`);
@@ -4743,6 +4751,18 @@ app.post('/support/live/:id/close', async (req, res) => {
 //      Systemmeldungen (kind = 'system') entstehen bei Beitritt/Bewerbung angenommen/Gruendung, Austritt und Kick; sender_* = betroffener Spieler (Name im Client anklickbar).
 //      Aufbewahrung: die letzten 200 Zeilen je Allianz; mit der Allianz (CASCADE) und bei Kontoloeschung (Zeilen des Spielers) geloescht.
 // #####################################################################
+// OFFERREF-START
+// NEU 07.11.2026 (Nutzerwunsch "Anwerben"): Ein Chat-Verweis "OFFER-<Trade-ID>" bewirbt ein eigenes, noch laufendes Handelsangebot (Handelschat, Allianzchat, Privatnachricht).
+// Geprueft wird: das Angebot gehoert dem Absender und laeuft noch. Der Client zeigt daraus eine Karte (Bild, Name, Preis, "Kaufen") mit den aktuellen Daten.
+async function chatOfferRef(raw, commanderId) {
+    const m = /^OFFER-(\d{1,9})$/.exec(String(raw || ''));
+    if (!m) return { ref: '' };
+    const r = await pool.query("SELECT 1 FROM market_offers WHERE id = $1 AND seller_commander_id = $2 AND status = 'active' AND expires_at > now()", [parseInt(m[1], 10), Number(commanderId)]);
+    if (!r.rows.length) return { ref: '', error: 'Dieses Angebot läuft nicht mehr oder gehört dir nicht.' };
+    return { ref: 'OFFER-' + m[1] };
+}
+// OFFERREF-ENDE
+
 // ALLIANCECHAT49-START
 const ALLIANCE_CHAT_KEEP = 200, ALLIANCE_CHAT_MAX_TEXT = 80, ALLIANCE_CHAT_UNVERIFIED_MAX = 30;
 const ALLIANCE_CHAT_GAP_MS = 1500, ALLIANCE_CHAT_UNVERIFIED_GAP_MS = 15000;
@@ -4773,12 +4793,12 @@ app.get('/alliances/:id/chat', async (req, res) => {
         if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
         const st = await allianceChatState(id, caller.commanderId);   // NEU 07.11.2026 (§52)
         if (!st.enabled) return res.json({ success: true, chatEnabled: false, isFounder: st.isFounder, allMutedUntil: '', youMutedUntil: st.youMutedUntil, messages: [] });
-        const cols = 'c.id, c.sender_commander_id, c.sender_name, c.text, c.kind, c.unverified, c.created_at, COALESCE(h.avatar_index, 0) AS avatar, r.name AS rank';   // rank = AKTUELLER Rang des Absenders in dieser Allianz (leer, wenn er nicht mehr Mitglied ist)
+        const cols = 'c.id, c.sender_commander_id, c.sender_name, c.text, c.kind, c.unverified, c.created_at, c.ref, COALESCE(h.avatar_index, 0) AS avatar, r.name AS rank';   // rank = AKTUELLER Rang des Absenders in dieser Allianz (leer, wenn er nicht mehr Mitglied ist)
         const from = ' FROM alliance_chat c LEFT JOIN commander_highscore h ON h.commander_id = c.sender_commander_id LEFT JOIN alliance_members am ON am.alliance_id = c.alliance_id AND am.commander_id = c.sender_commander_id LEFT JOIN alliance_ranks r ON r.id = am.rank_id WHERE c.alliance_id = $1';
         const r = since > 0
             ? await pool.query('SELECT ' + cols + from + ' AND c.id > $2 ORDER BY c.id ASC LIMIT 200', [id, since])
             : await pool.query('SELECT * FROM (SELECT ' + cols + from + ' ORDER BY c.id DESC LIMIT 100) t ORDER BY t.id ASC', [id]);
-        res.json({ success: true, chatEnabled: true, isFounder: st.isFounder, allMutedUntil: st.allMutedUntil, youMutedUntil: st.youMutedUntil, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+        res.json({ success: true, chatEnabled: true, isFounder: st.isFounder, allMutedUntil: st.allMutedUntil, youMutedUntil: st.youMutedUntil, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, ref: m.ref || '' })) });
     } catch (e) { console.error('[Allianzchat] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
@@ -4803,9 +4823,11 @@ app.post('/alliances/:id/chat', async (req, res) => {
         let masked = false;
         const wf = wordFilterMask(text);
         if (wf.hits > 0) { text = wf.text; masked = true; }
+        const offerRef = await chatOfferRef(req.body && req.body.ref, caller.commanderId);   // NEU 07.11.2026 (Anwerben)
+        if (req.body && req.body.ref && !offerRef.ref) return res.status(400).json({ success: false, error: offerRef.error || 'Ungültiger Verweis.' });
         const prof = await verifiedProfile(caller, null, null);
-        const r = await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind, unverified) VALUES ($1, $2, $3, $4, 'msg', $5) RETURNING id",
-            [id, caller.commanderId, prof.name, text, unverified]);
+        const r = await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind, unverified, ref) VALUES ($1, $2, $3, $4, 'msg', $5, $6) RETURNING id",
+            [id, caller.commanderId, prof.name, text, unverified, offerRef.ref || null]);
         await allianceChatTrim(id);
         res.json({ success: true, id: r.rows[0].id, masked, text });
     } catch (e) { console.error('[Allianzchat] schreiben:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
@@ -5315,14 +5337,14 @@ app.get('/dm/with/:otherId', async (req, res) => {
     if (!other || other < 1000000 || other === me) return dmFail(res, 400, 'Ungültiger Spieler.');
     try {
         const nm = (await pool.query('SELECT commander_name, avatar_index FROM commander_highscore WHERE commander_id = $1', [other])).rows[0];
-        const msgs = await pool.query('SELECT * FROM (SELECT id, sender_id, text, kind, unverified, created_at FROM dm_messages WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) ORDER BY id DESC LIMIT $3) t ORDER BY id ASC', [me, other, DM_THREAD_LIMIT]);
+        const msgs = await pool.query('SELECT * FROM (SELECT id, sender_id, text, kind, unverified, created_at, ref FROM dm_messages WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) ORDER BY id DESC LIMIT $3) t ORDER BY id ASC', [me, other, DM_THREAD_LIMIT]);
         const incoming = msgs.rows.filter(m => Number(m.sender_id) === other).reduce((mx, m) => Math.max(mx, Number(m.id)), 0);
         if (incoming > 0 && req.query.mark !== '0')
             await pool.query('INSERT INTO dm_reads (commander_id, other_id, last_read_id) VALUES ($1, $2, $3) ON CONFLICT (commander_id, other_id) DO UPDATE SET last_read_id = GREATEST(dm_reads.last_read_id, EXCLUDED.last_read_id)', [me, other, incoming]);
         const rl = (await dmRelations(me, [other])).get(other) || { rel: 'none', tag: '' };
         const blocked = (await pool.query('SELECT 1 FROM player_blocks WHERE blocker_commander_id = $1 AND blocked_commander_id = $2', [me, other])).rows.length > 0;
         res.json({ success: true, partner: { id: other, name: nm ? cleanDisplayName(nm.commander_name) : ('Commander ' + other), avatar: nm ? (nm.avatar_index || 0) : 0, tag: rl.tag, rel: rl.rel, blocked, exists: !!nm },
-            messages: msgs.rows.map(m => ({ id: String(m.id), senderId: Number(m.sender_id), text: m.kind === 'deleted' ? '' : m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+            messages: msgs.rows.map(m => ({ id: String(m.id), senderId: Number(m.sender_id), text: m.kind === 'deleted' ? '' : m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at, ref: m.kind === 'deleted' ? '' : (m.ref || '') })) });
     } catch (e) { console.error('[Privat] Verlauf:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
 });
 
@@ -5363,7 +5385,9 @@ app.post('/dm/send', async (req, res) => {
         let masked = false;
         const wf = wordFilterMask(text);
         if (wf.hits > 0) { text = wf.text; masked = true; }
-        const r = await pool.query("INSERT INTO dm_messages (sender_id, recipient_id, text, kind, unverified) VALUES ($1, $2, $3, 'msg', $4) RETURNING id, created_at", [me, other, text, unverified]);
+        const offerRef = await chatOfferRef(req.body && req.body.ref, me);   // NEU 07.11.2026 (Anwerben)
+        if (req.body && req.body.ref && !offerRef.ref) return dmFail(res, 400, offerRef.error || 'Ungültiger Verweis.');
+        const r = await pool.query("INSERT INTO dm_messages (sender_id, recipient_id, text, kind, unverified, ref) VALUES ($1, $2, $3, 'msg', $4, $5) RETURNING id, created_at", [me, other, text, unverified, offerRef.ref || null]);
         res.json({ success: true, id: String(r.rows[0].id), createdAt: r.rows[0].created_at, masked, text });
     } catch (e) { console.error('[Privat] senden:', e.message); dmFail(res, 500, 'Interner Serverfehler.'); }
 });
@@ -5641,13 +5665,15 @@ app.post('/chat/:channel', async (req, res) => {
     let text = String((req.body && req.body.text) || '').replace(/[<>\u0000-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '').replace(/\s+/g, ' ').trim();
     if (!text) return pubFail(res, 400, 'Nachricht fehlt.');
     if (text.length > PUB_MAX_TEXT) return pubFail(res, 400, 'Ungültige Nachricht (zu lang).');
-    const reportId = /^(CR|CHARTER)-[A-Za-z0-9\-]{1,60}$/.test(String((req.body && req.body.reportId) || '')) ? String(req.body.reportId) : '';
+    let reportId = /^(CR|CHARTER)-[A-Za-z0-9\-]{1,60}$/.test(String((req.body && req.body.reportId) || '')) ? String(req.body.reportId) : '';
+    const rawOfferRef = /^OFFER-\d{1,9}$/.test(String((req.body && req.body.reportId) || '')) ? String(req.body.reportId) : '';   // NEU 07.11.2026 (Anwerben): Pruefung weiter unten
     try {
         if (PUB_CHANNELS[ch].adminOnly && !isAdmin) return pubFail(res, 403, 'Dieser Kanal ist nur für Administratoren.');
         if (!isAdmin) {
             const mute = await pool.query('SELECT until FROM chat_mutes WHERE commander_id = $1 AND until > now()', [me]);
             if (mute.rows.length) return pubFail(res, 403, 'Du wurdest vom Support stummgeschaltet.' + muteUntilText(mute.rows[0].until));
         }
+        if (rawOfferRef) { const o = await chatOfferRef(rawOfferRef, me); if (!o.ref) return pubFail(res, 400, o.error); reportId = o.ref; }
         let unverified = false;
         if (EMAIL_GATE_ON && !isAdmin) { try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; } }
         if (unverified && text.length > PUB_UNVERIFIED_MAX)
@@ -10152,6 +10178,29 @@ function marketPriceBounds(kind, index, amount, priceResource) {
     return { fair, min, max };
 }
 
+// NEU 07.11.2026 (Nutzerwunsch): LIEFERZEIT gekaufter Schiffe. Mindestens 3 Stunden, je Sektor Entfernung zwischen dem Sektor des Verkaeufers und dem
+// Zielplaneten des Kaeufers kommen 2 Stunden dazu (gleicher Sektor = 3 h, drei Sektoren weiter = 9 h) - so wird lokaler Handel lukrativer.
+// Eine andere Galaxie zaehlt wie MARKET_DELIVERY_GALAXY_SECTORS Sektoren je Galaxie Abstand. Ressourcen kommen weiter sofort (nur Schiffe liefern mit Verzoegerung;
+// die Arten stehen in MARKET_DELIVERY_KINDS). Bezahlt wird sofort, das Schiff kommt erst bei Ankunft auf den Zielplaneten (POST /market/deliver, Aufrufer = Kaeufer).
+const MARKET_DELIVERY_BASE_HOURS       = 3;
+const MARKET_DELIVERY_PER_SECTOR_HOURS = 2;
+const MARKET_DELIVERY_GALAXY_SECTORS   = 5;
+const MARKET_DELIVERY_KINDS            = ['warship', 'ship'];
+
+function marketCoordParts(coord) {
+    const m = /^(\d+):(\d+):(\d+):(\d+)$/.exec(String(coord || ''));
+    return m ? { g: parseInt(m[1], 10), s: parseInt(m[2], 10), sys: parseInt(m[3], 10), p: parseInt(m[4], 10) } : null;
+}
+function marketSectorDistance(coordA, coordB) {
+    const a = marketCoordParts(coordA), b = marketCoordParts(coordB);
+    if (!a || !b) return 0;
+    return Math.abs(a.s - b.s) + MARKET_DELIVERY_GALAXY_SECTORS * Math.abs(a.g - b.g);
+}
+function marketDeliveryHours(kind, sellerCoord, targetCoord) {
+    if (!MARKET_DELIVERY_KINDS.includes(kind)) return 0;
+    return MARKET_DELIVERY_BASE_HOURS + MARKET_DELIVERY_PER_SECTOR_HOURS * marketSectorDistance(sellerCoord, targetCoord);
+}
+
 const marketLocks = new Map();
 function withMarketLock(key, fn) {
     const previous = marketLocks.get(key) || Promise.resolve();
@@ -10268,10 +10317,12 @@ function marketNum(n) { return Number(n).toLocaleString('de-DE'); }
 
 function marketOfferOut(r) {
     const b = marketPriceBounds(r.item_kind, r.resource_index, r.amount, r.price_resource);
+    const sc = marketCoordParts(r.seller_coord);   // NEU 07.11.2026: Galaxie/Sektor des Verkaeufers (fuer Entfernung, Sortierung, Filter) - die Planetenkoordinate selbst bleibt geheim
     return {
         id: r.id, sellerName: r.seller_name, sellerCommanderId: r.seller_commander_id,
         kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount,
-        priceResource: r.price_resource, priceAmount: r.price_amount, fairAmount: b.fair, secondsLeft: r.seconds_left
+        priceResource: r.price_resource, priceAmount: r.price_amount, fairAmount: b.fair, secondsLeft: r.seconds_left,
+        sellerGalaxy: sc ? sc.g : 0, sellerSector: sc ? sc.s : 0
     };
 }
 
@@ -10363,10 +10414,16 @@ app.get('/market/offers', async (req, res) => {
             params.push(exclude);
             where += ` AND seller_commander_id <> $${params.length}`;
         }
+        // NEU 07.11.2026: Filter nach Sektor des Verkaeufers (von/bis, einschliesslich); gilt nicht bei der Suche nach einer Trade-ID
+        if (tradeId === null) {
+            const secFrom = marketStrictInt(req.query.sectorFrom), secTo = marketStrictInt(req.query.sectorTo);
+            if (Number.isInteger(secFrom) && secFrom > 0) { params.push(secFrom); where += ` AND split_part(seller_coord, ':', 2)::int >= $${params.length}`; }
+            if (Number.isInteger(secTo) && secTo > 0) { params.push(secTo); where += ` AND split_part(seller_coord, ':', 2)::int <= $${params.length}`; }
+        }
         params.push(limit);
 
         const result = await pool.query(
-            `SELECT id, seller_name, seller_commander_id, item_kind, resource_index, amount, price_resource, price_amount,
+            `SELECT id, seller_name, seller_commander_id, item_kind, resource_index, amount, price_resource, price_amount, seller_coord,
                     GREATEST(0, EXTRACT(EPOCH FROM (expires_at - now())))::int AS seconds_left
              FROM market_offers
              WHERE ${where}
@@ -10411,6 +10468,11 @@ app.get('/market/mine', async (req, res) => {
         const activeCount = await pool.query(
             `SELECT COUNT(*)::int AS n FROM market_offers
              WHERE seller_commander_id = $1 AND status = 'active' AND expires_at > now()`, [who.commanderId]);
+        // NEU 07.11.2026: gekaufte Schiffe, die noch unterwegs sind (Dashboard: "Ein gekauftes Schiff befindet sich auf dem Weg ...")
+        const onTheWay = await pool.query(
+            `SELECT id, item_kind, resource_index, amount, buyer_coord, GREATEST(0, EXTRACT(EPOCH FROM (deliver_at - now())))::int AS seconds_left
+             FROM market_offers WHERE buyer_commander_id = $1 AND status = 'sold' AND delivered = false
+             ORDER BY deliver_at ASC LIMIT 50`, [who.commanderId]);
 
         const items = [];
         for (const kind of Object.keys(MARKET_KINDS)) {
@@ -10436,7 +10498,9 @@ app.get('/market/mine', async (req, res) => {
                 id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, priceResource: r.price_resource, priceAmount: r.price_amount,
                 sellerName: r.seller_name, agoSeconds: r.ago_seconds
             })),
-            pending: { count: pending.rows[0].n, soldCount: pending.rows[0].sold, returnCount: pending.rows[0].returns }
+            pending: { count: pending.rows[0].n, soldCount: pending.rows[0].sold, returnCount: pending.rows[0].returns, deliveryDue: onTheWay.rows.filter(r => r.seconds_left <= 0).length },
+            deliveries: onTheWay.rows.map(r => ({ id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, coord: r.buyer_coord, secondsLeft: r.seconds_left })),
+            delivery: { baseHours: MARKET_DELIVERY_BASE_HOURS, perSectorHours: MARKET_DELIVERY_PER_SECTOR_HOURS, galaxySectors: MARKET_DELIVERY_GALAXY_SECTORS, kinds: MARKET_DELIVERY_KINDS }
         });
     } catch (error) {
         console.error('[Handel] mine GET Fehler:', error.message);
@@ -10566,25 +10630,33 @@ app.post('/market/buy', async (req, res) => {
             const tax = offer.price_amount - payout;
             const buyerName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
 
+            // NEU 07.11.2026: Schiffe haben eine Lieferzeit (mindestens 3 h, je Sektor Entfernung +2 h); Ressourcen kommen sofort (hours = 0)
+            // Uebergang: nur Clients, die "deliveryAware" melden (neuer Build, holt Lieferungen ueber /market/deliver ab), bekommen die Lieferzeit. Aeltere Clients
+            // wuerden gekaufte Schiffe nie abholen -> sie bekommen sie wie bisher sofort. SOBALD ALLE AUF DEM NEUEN BUILD SIND (Mindestversion), diese Bedingung entfernen.
+            const deliveryAware = !!(req.body && req.body.deliveryAware === true);
+            const deliveryHours = deliveryAware ? marketDeliveryHours(offer.item_kind, offer.seller_coord, target) : 0;
+
             // Nur EIN gleichzeitiger Kaeufer gewinnt (Bedingung steckt im UPDATE selbst).
             const claimed = await pool.query(
                 `UPDATE market_offers
-                 SET status = 'sold', sold_at = now(), buyer_commander_id = $2, buyer_name = $3, payout_amount = $4, tax_amount = $5
+                 SET status = 'sold', sold_at = now(), buyer_commander_id = $2, buyer_name = $3, payout_amount = $4, tax_amount = $5,
+                     buyer_coord = $6, deliver_at = CASE WHEN $7::int > 0 THEN now() + make_interval(hours => $7::int) ELSE NULL END, delivered = ($7::int = 0)
                  WHERE id = $1 AND status = 'active' AND expires_at > now() AND seller_commander_id <> $2
-                 RETURNING id`, [offerId, who.commanderId, buyerName, payout, tax]);
+                 RETURNING id`, [offerId, who.commanderId, buyerName, payout, tax, target, deliveryHours]);
             if (claimed.rows.length === 0)
                 return { status: 409, body: { success: false, error: 'Dieses Angebot ist nicht mehr verfügbar.' } };
 
             try {
                 marketRemove(planet, 'resource', offer.price_resource, offer.price_amount);
-                marketAdd(planet, offer.item_kind, offer.resource_index, offer.amount);
+                if (deliveryHours === 0) marketAdd(planet, offer.item_kind, offer.resource_index, offer.amount);   // Schiffe: erst bei Ankunft (POST /market/deliver)
                 await marketSaveEntries(who.playFabId, { [marketPlanetKey(target)]: planet });
             } catch (saveError) {
                 console.error('[Handel] buy: Speichern fehlgeschlagen, gebe Angebot ' + offerId + ' wieder frei:', saveError.message);
                 try {
                     await pool.query(
                         `UPDATE market_offers
-                         SET status = 'active', sold_at = NULL, buyer_commander_id = NULL, buyer_name = NULL, payout_amount = 0, tax_amount = 0
+                         SET status = 'active', sold_at = NULL, buyer_commander_id = NULL, buyer_name = NULL, payout_amount = 0, tax_amount = 0,
+                             buyer_coord = NULL, deliver_at = NULL, delivered = true
                          WHERE id = $1 AND status = 'sold' AND settled = false`, [offerId]);
                 } catch (revertError) {
                     console.error('[Handel] buy: FREIGABE FEHLGESCHLAGEN (Angebot ' + offerId + '):', revertError.message);
@@ -10594,7 +10666,8 @@ app.post('/market/buy', async (req, res) => {
 
             console.log(`[Handel] Verkauf ${offerId}: Commander ${who.commanderId} kauft ${offer.amount}x ${offer.item_kind}#${offer.resource_index} fuer ${offer.price_amount}x Ress${offer.price_resource + 1} (Verkaeufer ${payout}, Steuer ${tax})`);
             mailJob = { offer, buyerName, payout, tax };
-            return { status: 200, body: { success: true, offerId, kind: offer.item_kind, itemIndex: offer.resource_index, amount: offer.amount, priceResource: offer.price_resource, priceAmount: offer.price_amount, targetCoord: target } };
+            return { status: 200, body: { success: true, offerId, kind: offer.item_kind, itemIndex: offer.resource_index, amount: offer.amount, priceResource: offer.price_resource, priceAmount: offer.price_amount, targetCoord: target,
+                deliveryHours, deliverSeconds: deliveryHours * 3600 } };
         });
         res.status(outcome.status).json(outcome.body);
         // Mail NACH der Antwort und ausserhalb des Kaeufer-Locks (der Kauf ist abgeschlossen; Mail-Fehler sind unkritisch).
@@ -10657,6 +10730,59 @@ app.post('/market/cancel', async (req, res) => {
     } catch (error) {
         console.error('[Handel] cancel Fehler:', error.message);
         marketFail(res, 500, 'Angebot konnte nicht zurückgezogen werden.');
+    }
+});
+
+// -------------------------------------------------------
+// POST /market/deliver {} - NEU 07.11.2026: angekommene Schiffe (Lieferzeit abgelaufen) auf den Zielplaneten des Kaeufers buchen.
+// Der Aufrufer ist der Kaeufer selbst und uebernimmt das Ergebnis sofort lokal (Differenz); der Server schreibt dieselben Werte nach PlayFab.
+// Gehoert der Zielplanet nicht mehr dem Kaeufer, kommt das Schiff auf seinen Hauptplaneten (marketReturnCoord).
+// -------------------------------------------------------
+app.post('/market/deliver', async (req, res) => {
+    const who = await marketIdentity(req);
+    if (!who) return marketFail(res, 401, 'Nicht angemeldet.');
+    try {
+        const outcome = await withMarketLock(who.playFabId, async () => {
+            const rows = await pool.query(
+                `UPDATE market_offers SET delivered = true
+                 WHERE buyer_commander_id = $1 AND status = 'sold' AND delivered = false AND deliver_at <= now()
+                 RETURNING id, item_kind, resource_index, amount, buyer_coord, seller_name`, [who.commanderId]);
+            if (rows.rows.length === 0) return { status: 200, body: { success: true, deliveries: [] } };
+            const ids = rows.rows.map(r => r.id);
+            const revert = async () => {
+                try { await pool.query('UPDATE market_offers SET delivered = false WHERE id = ANY($1::int[])', [ids]); }
+                catch (e) { console.error('[Handel] deliver: FREIGABE FEHLGESCHLAGEN (Commander ' + who.commanderId + '):', e.message); }
+            };
+            try {
+                const player = await marketLoadPlayer(who.playFabId, []);
+                if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
+                const targets = new Map();   // id -> Zielplanet
+                for (const r of rows.rows) {
+                    const coord = marketReturnCoord(player.commander, r.buyer_coord);
+                    if (!coord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Lieferung gefunden.' } }; }
+                    targets.set(r.id, coord);
+                }
+                const planets = await marketLoadPlanets(who.playFabId, Array.from(new Set(targets.values())));
+                const entries = {}, out = [];
+                for (const r of rows.rows) {
+                    const coord = targets.get(r.id), planet = planets[coord];
+                    if (!planet) { await revert(); return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } }; }
+                    marketAdd(planet, r.item_kind, r.resource_index, r.amount);
+                    entries[marketPlanetKey(coord)] = planet;
+                    out.push({ id: r.id, coord, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, sellerName: r.seller_name });
+                }
+                await marketSaveEntries(who.playFabId, entries);
+                console.log(`[Handel] Lieferung an Commander ${who.commanderId}: ${out.length} Schiff(e) angekommen`);
+                return { status: 200, body: { success: true, deliveries: out } };
+            } catch (error) {
+                await revert();
+                throw error;
+            }
+        });
+        res.status(outcome.status).json(outcome.body);
+    } catch (error) {
+        console.error('[Handel] deliver Fehler:', error.message);
+        if (!res.headersSent) marketFail(res, 500, 'Lieferung konnte nicht gebucht werden.');
     }
 });
 
