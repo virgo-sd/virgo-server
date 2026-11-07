@@ -56,6 +56,8 @@
 //  §28  INVENTAR (PlayFab Internal Data "inventory"): Kisten (Rohstoffe Ress01-10, Schiffe), Oeffnen, Admin-Vergabe "#inv"; steht VOR §21
 //  §53  PRIVATNACHRICHTEN (dm_messages/dm_reads, GET /dm/conversations|with|unread|find, POST /dm/send|delete; Beziehungsfarbe, Spamschutz); steht VOR §11
 //  §54  AGI AITAN IM CHAT (agi_messages, GET /agi/messages, POST /agi/command; Begruessung, Krieg/Frieden/Buendnis, neue Sektoren); steht VOR §11
+//  §56  PLAYFAB-SCHUTZ UND WARTERAUM (pfCall-Tor mit Prioritaeten, 429-Abwarten, 503 statt Abmelden, /gate/enter|poll|report|status); steht VOR §02b
+//  §55  OEFFENTLICHE CHATS (public_chat, GET/POST /chat/:kanal, POST /chat/:kanal/delete; Global 0, Handel 1, Event 3; Zwischenspeicher, kein PlayFab); steht VOR §11
 //  §45  KONTO AENDERN: E-MAIL UND PASSWORT (POST /account/change-email, /account/password-link; verlangen das aktuelle Passwort); steht VOR §21
 //  §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword; Konto loeschen verlangt das Passwort, wenn ACCOUNT_DELETE_NEEDS_PASSWORD=true); steht VOR §21
 //  (§43 NEUES PASSWORT SETZEN wurde am 25.10.2026 wieder entfernt: Reset laeuft ueber PlayFabs Standard-Seite, Entscheidung B)
@@ -157,6 +159,7 @@ const AUTH_POLICY = [
     ['*',    /^\/$/,                           'public'],   // Startseite / Render-Healthcheck
     ['GET',  /^\/legal-texts$/,                'public'],   // AGB muessen VOR dem Login lesbar sein
     ['GET',  /^\/version$/,                    'public'],   // NEU 31.10.2026 (§46): Mindestversion des Clients, vor dem Login
+    ['*',    /^\/gate\/.+/,                    'public'],   // NEU 07.11.2026 (§56): Warteraum vor Registrierung/Anmeldung/Passwort-Mail
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
     ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
     ['POST', /^\/auth\/exists$/,               'public'],   // NEU 25.10.2026 (§41): "gibt es dieses Konto?" vor dem Login (streng begrenzt)
@@ -197,25 +200,187 @@ function authLog(req, reason, detail, blocked) {
     console.warn(`[Auth][${blocked ? 'BLOCKIERT' : AUTH_MODE}] ${key}${detail ? ' - ' + detail : ''}`);
 }
 
-async function authenticateTicket(ticket) {
-    const cached = authTicketCache.get(ticket);
-    if (cached && cached.expires > Date.now()) return cached.playFabId;
+// #####################################################################
+// §56  PLAYFAB-SCHUTZ UND WARTERAUM (07.11.2026, Nutzerwunsch: Registrierung, Anmeldung und Passwort-Mail muessen IMMER erreichbar bleiben)
+//      1) Alle PlayFab-Aufrufe des Servers laufen durch EIN Tor (pfCall): hoechstens PF_MAX_INFLIGHT gleichzeitig, drei Spuren (high = Ticket-Pruefung,
+//         Commander-ID-Vergabe/Registrierung; normal; low). Antwortet PlayFab mit "zu viele Anfragen" (HTTP 429) oder kurz mit 5xx, wartet der Server (Retry-After /
+//         wachsende Pausen, bis zu 3 Wiederholungen) und arbeitet die Warteschlange danach der Reihe nach ab - HOHE Spur zuerst.
+//      2) PlayFab nicht erreichbar/ausgelastet darf NIE "Ticket ungueltig" bedeuten (sonst wuerden alle Spieler abgemeldet): die Pruefung antwortet dann 503
+//         (code PLAYFAB-AUSGELASTET, Retry-After), ein erst kurz abgelaufenes Ticket zaehlt noch 30 Minuten weiter.
+//      3) WARTERAUM fuer Registrierung (register), Anmeldung (login) und Passwort-Mail (recover). Diese PlayFab-Aufrufe macht der Client direkt (Passwoerter laufen
+//         NIE ueber unseren Server). Vorher fragt er hier an: ist alles frei, antwortet der Server sofort "go". Ist PlayFab ausgelastet (429 am Server oder von einem
+//         Client gemeldet) oder kommen zu viele auf einmal (Burst je Minute), landet der Spieler in einer Warteschlange und bekommt der Reihe nach einen Platz
+//         (register/recover alle 2,5 s, login alle 1,2 s) - "eins nach dem anderen". Faellt der Warteraum selbst aus, geht der Client trotzdem direkt (fail-open).
+//      Schalter (Render): GATE_FORCE = on | off | auto (Standard auto), PF_MAX_INFLIGHT (Standard 12).
+// #####################################################################
+// PLAYFAB56-START
+const PF_MAX_INFLIGHT = parseInt(process.env.PF_MAX_INFLIGHT, 10) || 12;
+const PF_MAX_RETRIES = 3, PF_BACKOFF_UNIT_MS = process.env.NODE_ENV === 'test' ? 4 : 1000, PF_STALE_TICKET_MS = 30 * 60 * 1000;
+const pfGate = { inflight: 0, throttledUntil: 0, q: { high: [], normal: [], low: [] }, hits: [], timer: null, retries: 0 };
+
+function pfDefaultPrio(endpoint, data) {
+    if (endpoint === '/Server/AuthenticateSessionTicket') return 'high';
+    const d = data || {};
+    if (endpoint === '/Server/GetUserInternalData' && Array.isArray(d.Keys) && d.Keys.includes('commanderId')) return 'high';
+    if ((endpoint === '/Server/GetTitleInternalData' || endpoint === '/Server/SetTitleInternalData') && (d.Key === 'NextCommanderId' || (Array.isArray(d.Keys) && d.Keys.includes('NextCommanderId')))) return 'high';
+    if (endpoint === '/Server/UpdateUserInternalData' && d.Data && d.Data.commanderId !== undefined) return 'high';
+    return 'normal';
+}
+function pfNote429(waitMs) {
+    const now = Date.now();
+    pfGate.hits.push(now);
+    if (pfGate.hits.length > 200) pfGate.hits.splice(0, pfGate.hits.length - 200);
+    pfGate.throttledUntil = Math.max(pfGate.throttledUntil, now + waitMs);
+    if (typeof gateMarkBusy === 'function') gateMarkBusy(60000);
+}
+function pfIsBusy() { const now = Date.now(); return now < pfGate.throttledUntil || pfGate.hits.some(t => now - t < 60000); }
+function pfQueued() { return pfGate.q.high.length + pfGate.q.normal.length + pfGate.q.low.length; }
+
+function pfCall(endpoint, data, prio, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const p = prio || pfDefaultPrio(endpoint, data);
+        pfGate.q[p].push({ endpoint, data, prio: p, timeout: timeoutMs || 20000, tries: 0, resolve, reject });
+        pfPump();
+    });
+}
+function pfPump() {
+    while (pfGate.inflight < PF_MAX_INFLIGHT) {
+        if (Date.now() < pfGate.throttledUntil) {
+            if (pfQueued() > 0 && !pfGate.timer) {
+                pfGate.timer = setTimeout(() => { pfGate.timer = null; pfPump(); }, Math.max(10, pfGate.throttledUntil - Date.now()));
+            }
+            return;
+        }
+        const job = pfGate.q.high.shift() || pfGate.q.normal.shift() || pfGate.q.low.shift();
+        if (!job) return;
+        pfRun(job);
+    }
+}
+async function pfRun(job) {
+    pfGate.inflight++;
     try {
-        const response = await axios.post(
-            `${PLAYFAB_BASE_URL}/Server/AuthenticateSessionTicket`,
-            { SessionTicket: ticket },
-            { headers: { 'Content-Type': 'application/json', 'X-SecretKey': PLAYFAB_SECRET }, timeout: 5000 }
-        );
-        const playFabId = response.data?.data?.UserInfo?.PlayFabId || null;
+        const r = await axios.post(`${PLAYFAB_BASE_URL}${job.endpoint}`, job.data, { headers: { 'Content-Type': 'application/json', 'X-SecretKey': PLAYFAB_SECRET }, timeout: job.timeout });
+        pfGate.inflight--;
+        job.resolve(r.data.data);
+    } catch (e) {
+        pfGate.inflight--;
+        const st = e.response && e.response.status, body = e.response && e.response.data;
+        const throttled = st === 429 || (body && /throttl|ratelimit|rate limit/i.test(JSON.stringify(body).slice(0, 400)));
+        const server5xx = st >= 500;
+        const netErr = !e.response && /ECONNRESET|ETIMEDOUT|ECONNABORTED|ENETUNREACH|EAI_AGAIN|ECONNREFUSED/.test(String(e.code || e.message));
+        const readOnly = /\/(Get|Authenticate)/.test(job.endpoint);   // Netzfehler nur bei Lesezugriffen wiederholen (Schreiben koennte schon angekommen sein)
+        const retry = (throttled || server5xx || (netErr && readOnly)) && job.tries < PF_MAX_RETRIES;
+        if (retry) {
+            job.tries++; pfGate.retries++;
+            const ra = parseFloat(e.response && e.response.headers && e.response.headers['retry-after']);
+            const wait = Math.min(10000, throttled ? (isFinite(ra) ? ra * 1000 : PF_BACKOFF_UNIT_MS * Math.pow(2, job.tries)) : PF_BACKOFF_UNIT_MS * job.tries);
+            if (throttled) pfNote429(wait);
+            pfGate.q[job.prio].unshift(job);
+        } else {
+            if (throttled) { pfNote429(5000); e.pfThrottled = true; }
+            e.pfUnavailable = !!(throttled || server5xx || netErr);
+            job.reject(e);
+        }
+    }
+    pfPump();
+}
+
+// Ergebnis { playFabId } oder { unavailable: true } (PlayFab ausgelastet/nicht erreichbar) - "unavailable" ist NIE "Ticket ungueltig"
+async function authenticateTicketChecked(ticket) {
+    const cached = authTicketCache.get(ticket);
+    if (cached && cached.expires > Date.now()) return { playFabId: cached.playFabId };
+    try {
+        const data = await pfCall('/Server/AuthenticateSessionTicket', { SessionTicket: ticket }, 'high', 8000);
+        const playFabId = (data && data.UserInfo && data.UserInfo.PlayFabId) || null;
         if (playFabId) {
             if (authTicketCache.size > AUTH_CACHE_MAX) authTicketCache.clear();
             authTicketCache.set(ticket, { playFabId, expires: Date.now() + AUTH_TICKET_TTL_MS });
         }
-        return playFabId;
+        return { playFabId };
     } catch (error) {
-        return null;
+        if (error && error.pfUnavailable) {
+            if (cached && cached.expires + PF_STALE_TICKET_MS > Date.now()) return { playFabId: cached.playFabId };   // Gnadenfrist
+            return { unavailable: true };
+        }
+        return { playFabId: null };
     }
 }
+async function authenticateTicket(ticket) {
+    const r = await authenticateTicketChecked(ticket);
+    return r.playFabId || null;
+}
+
+// ---------------- Warteraum ----------------
+const GATE_KINDS = ['register', 'login', 'recover'];
+const GATE_SLOT_MS = { register: 2500, login: 1200, recover: 2500 };
+const GATE_BURST = { register: 15, login: 60, recover: 15 };          // so viele je Minute gehen ohne Warteraum durch
+const GATE_TICKET_TTL_MS = 40000, GATE_FORCE = (process.env.GATE_FORCE || 'auto').toLowerCase();
+const gate = { busyUntil: 0, nextSlot: { register: 0, login: 0, recover: 0 }, recent: { register: [], login: [], recover: [] }, tickets: new Map() };
+
+function gateMarkBusy(ms) { gate.busyUntil = Math.max(gate.busyUntil, Date.now() + ms); }
+function gateActive(kind) {
+    if (GATE_FORCE === 'on') return true;
+    if (GATE_FORCE === 'off') return false;
+    const now = Date.now();
+    return now < gate.busyUntil || pfIsBusy() || gate.recent[kind].filter(t => now - t < 60000).length >= GATE_BURST[kind];
+}
+function gateClientIp(req) {
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    return String(req.headers['cf-connecting-ip'] || '').trim() || (xff.length > 1 ? xff[xff.length - 2] : (xff[0] || 'direkt'));
+}
+function gatePosition(kind, slotAt) {
+    let ahead = 0;
+    for (const t of gate.tickets.values()) if (t.kind === kind && t.slotAt < slotAt) ahead++;
+    return ahead + 1;
+}
+function gateSweep() {
+    const now = Date.now();
+    for (const [id, t] of gate.tickets) if (now - t.lastSeen > GATE_TICKET_TTL_MS) gate.tickets.delete(id);
+    for (const k of GATE_KINDS) gate.recent[k] = gate.recent[k].filter(t => now - t < 60000);
+}
+if (typeof setInterval === 'function' && process.env.NODE_ENV !== 'test') { const gs = setInterval(gateSweep, 15000); if (gs.unref) gs.unref(); }
+
+app.post('/gate/enter', (req, res) => {
+    const kind = String((req.body && req.body.kind) || '');
+    if (!GATE_KINDS.includes(kind)) return res.status(400).json({ success: false, error: 'Ungültige Art.' });
+    if (rateLimited('gateip|' + gateClientIp(req), 40, 60000)) return res.status(429).json({ success: false, error: 'Zu viele Anfragen.' });
+    gateSweep();
+    const now = Date.now();
+    if (!gateActive(kind)) { gate.recent[kind].push(now); return res.json({ success: true, go: true, ticket: '', position: 0, waitSeconds: 0 }); }
+    const slotAt = Math.max(now, gate.nextSlot[kind]);
+    gate.nextSlot[kind] = slotAt + GATE_SLOT_MS[kind];
+    if (slotAt <= now) { gate.recent[kind].push(now); return res.json({ success: true, go: true, ticket: '', position: 0, waitSeconds: 0 }); }   // der Platz ist sofort frei: kein Ticket noetig
+    const id = require('crypto').randomBytes(9).toString('hex');
+    gate.tickets.set(id, { kind, slotAt, lastSeen: now });
+    res.json({ success: true, go: false, ticket: id, position: gatePosition(kind, slotAt), waitSeconds: Math.ceil((slotAt - now) / 1000) });
+});
+
+app.post('/gate/poll', (req, res) => {
+    const id = String((req.body && req.body.ticket) || '');
+    if (rateLimited('gateip|' + gateClientIp(req), 120, 60000)) return res.status(429).json({ success: false, error: 'Zu viele Anfragen.' });
+    const t = gate.tickets.get(id);
+    if (!t) return res.json({ success: true, go: false, unknown: true });
+    const now = Date.now();
+    t.lastSeen = now;
+    if (now >= t.slotAt) { gate.tickets.delete(id); gate.recent[t.kind].push(now); return res.json({ success: true, go: true, position: 0, waitSeconds: 0 }); }
+    res.json({ success: true, go: false, position: gatePosition(t.kind, t.slotAt), waitSeconds: Math.ceil((t.slotAt - now) / 1000) });
+});
+
+// Ein Client hat von PlayFab "zu viele Anfragen" bekommen: ab jetzt 60 s lang Warteraum fuer alle
+app.post('/gate/report', (req, res) => {
+    if (rateLimited('gateip|' + gateClientIp(req), 30, 60000)) return res.status(429).json({ success: false });
+    gateMarkBusy(60000);
+    res.json({ success: true });
+});
+
+app.get('/gate/status', (req, res) => {
+    const now = Date.now();
+    const waiting = {}; for (const k of GATE_KINDS) waiting[k] = 0;
+    for (const t of gate.tickets.values()) waiting[t.kind]++;
+    res.json({ success: true, mode: GATE_FORCE, busy: pfIsBusy(), warteraum: now < gate.busyUntil, waiting, pfQueued: pfQueued(), pfInflight: pfGate.inflight, pf429LastMinute: pfGate.hits.filter(t => now - t < 60000).length, retries: pfGate.retries });
+});
+// PLAYFAB56-ENDE
+
 
 // Commander-ID eines Spielers: PlayFab (UserInternalData "commanderId") ist die
 // Quelle der Wahrheit; commander_highscore dient nur als Rueckfall.
@@ -224,12 +389,8 @@ async function authCommanderIdFor(playFabId) {
     if (cached && cached.expires > Date.now()) return cached.commanderId;
     let commanderId = null;
     try {
-        const response = await axios.post(
-            `${PLAYFAB_BASE_URL}/Server/GetUserInternalData`,
-            { PlayFabId: playFabId, Keys: ['commanderId'] },
-            { headers: { 'Content-Type': 'application/json', 'X-SecretKey': PLAYFAB_SECRET }, timeout: 5000 }
-        );
-        const value = parseInt(response.data?.data?.Data?.commanderId?.Value, 10);
+        const pfData = await pfCall('/Server/GetUserInternalData', { PlayFabId: playFabId, Keys: ['commanderId'] }, 'high', 8000);   // NEU 07.11.2026 (§56): durch das PlayFab-Tor
+        const value = parseInt(pfData && pfData.Data && pfData.Data.commanderId && pfData.Data.commanderId.Value, 10);
         if (!isNaN(value)) commanderId = value;
     } catch (error) { /* Rueckfall unten */ }
     if (commanderId === null) {
@@ -306,7 +467,13 @@ app.use(async (req, res, next) => {
         if (!ticket) {
             problem = { reason: 'KEIN-TICKET' };
         } else {
-            const playFabId = await authenticateTicket(ticket);
+            const chk = await authenticateTicketChecked(ticket);   // NEU 07.11.2026 (§56)
+            const playFabId = chk.playFabId;
+            if (chk.unavailable) {   // PlayFab ausgelastet/nicht erreichbar: NICHT als "Ticket ungueltig" werten (sonst wuerden Spieler abgemeldet)
+                if (!enforcing) return next();
+                res.set('Retry-After', '5');
+                return res.status(503).json({ success: false, error: 'Der Dienst ist gerade ausgelastet. Bitte gleich noch einmal versuchen.', code: 'PLAYFAB-AUSGELASTET' });
+            }
             if (!playFabId) {
                 problem = { reason: 'TICKET-UNGUELTIG' };
             } else {
@@ -1061,6 +1228,10 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_messages (recipient_id, id DESC);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS dm_reads (commander_id INTEGER NOT NULL, other_id INTEGER NOT NULL, last_read_id BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (commander_id, other_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS agi_messages (id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, text_de TEXT NOT NULL, text_en TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        // NEU 07.11.2026 (§55): oeffentliche Chats (Global 0, Handel 1, Event 3) auf unserem Server
+        await pool.query(`CREATE TABLE IF NOT EXISTS public_chat (id BIGSERIAL PRIMARY KEY, channel SMALLINT NOT NULL, sender_commander_id INTEGER, sender_name TEXT NOT NULL DEFAULT '', avatar_index INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL DEFAULT '', text_en TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, report_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_public_chat_channel ON public_chat (channel, id DESC);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_public_chat_sender ON public_chat (sender_commander_id);`);
         // NEU 07.11.2026 (§52): Stummschalten, Allianz-Chat-Einstellungen, Kontext-Protokoll, Verweis auf die gemeldete Chat-Zeile
         await pool.query(`CREATE TABLE IF NOT EXISTS chat_mutes (commander_id INTEGER PRIMARY KEY, until TIMESTAMPTZ NOT NULL, by_commander_id INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat_settings (alliance_id INTEGER PRIMARY KEY REFERENCES alliances(id) ON DELETE CASCADE, chat_enabled BOOLEAN NOT NULL DEFAULT true, muted_until TIMESTAMPTZ);`);
@@ -4876,6 +5047,8 @@ async function retentionMaintain() {
         const c = await pool.query('DELETE FROM alliance_chat WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);
         await pool.query('DELETE FROM dm_messages WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);   // NEU 07.11.2026 (§53)
         await pool.query('DELETE FROM agi_messages WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);   // NEU 07.11.2026 (§54)
+        await pool.query('DELETE FROM public_chat WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);   // NEU 07.11.2026 (§55)
+        if (typeof pubCache !== 'undefined') pubCache.clear();
         await pool.query('DELETE FROM chat_mutes WHERE until < now()');
         await pool.query('DELETE FROM alliance_chat_mutes WHERE until < now()');
         await pool.query('DELETE FROM report_context_log WHERE created_at < now() - $1::interval', [RETENTION_DONE_DAYS + ' days']);
@@ -5237,6 +5410,7 @@ async function agiPost(kind, de, en) {
     try {
         await pool.query('INSERT INTO agi_messages (kind, text_de, text_en) VALUES ($1, $2, $3)', [kind, String(de).slice(0, 300), String(en).slice(0, 300)]);
         await pool.query('DELETE FROM agi_messages WHERE id NOT IN (SELECT id FROM agi_messages ORDER BY id DESC LIMIT $1)', [AGI_KEEP]);
+        if (typeof pubInsert === 'function') await pubInsert(0, { senderId: 0, senderName: 'AGI Aitan', text: String(de).slice(0, 300), textEn: String(en).slice(0, 300), kind: 'agi' });   // NEU 07.11.2026 (§55): steht jetzt direkt im Globalen Chat (alte Clients lesen weiter agi_messages)
     } catch (e) { console.error('[AGI] schreiben fehlgeschlagen:', e.message); }
 }
 const agiClean = s => cleanDisplayName(s).replace(/[\[\]]/g, '');
@@ -5378,6 +5552,117 @@ app.post('/agi/command', async (req, res) => {
     } catch (e) { console.error('[AGI] Befehl:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 // AGI54-ENDE
+
+// #####################################################################
+// §55  OEFFENTLICHE CHATS AUF UNSEREM SERVER (07.11.2026, Nutzerwunsch: PlayFab entlasten)
+//      Globaler Chat (0), Handelschat (1) und Event-Chat (3) liefen bisher ueber PlayFab (jeder angemeldete Spieler fragte alle 5 s ein CloudScript, das
+//      die Title Data las; Senden kostete ~6 PlayFab-Aufrufe). Jetzt: Postgres-Tabelle public_chat + Zwischenspeicher im Arbeitsspeicher (Abfragen mit
+//      "since" kosten keine Datenbank-Abfrage). PlayFab wird fuer Chat gar nicht mehr gebraucht - es bleibt frei fuer Registrierung, Anmeldung, Passwort-Mail.
+//      Regeln wie bisher: max. 80 Zeichen, Abstand 1,5 s, ohne bestaetigte E-Mail "Unregistriert" (30 Zeichen, 15 s), Wortfilter MASKIERT,
+//      Admin-Stummschaltung (chat_mutes), Event-Chat nur Admin, 90 Tage Aufbewahrung. Loeschen: eigene Zeile -> Platzhalter (kind 'deleted', Marke 's<Nr>'),
+//      Admin loescht fremde Zeile (weg, Marke '<Nr>'). AGI Aitan schreibt hier hinein (kind 'agi', Deutsch in text, Englisch in text_en).
+// #####################################################################
+// PUBCHAT55-START
+const PUB_CHANNELS = { 0: { keep: 300, adminOnly: false }, 1: { keep: 300, adminOnly: false }, 3: { keep: 100, adminOnly: true } };
+const PUB_MAX_TEXT = 80, PUB_UNVERIFIED_MAX = 30, PUB_GAP_MS = 1500, PUB_UNVERIFIED_GAP_MS = 15000, PUB_CACHE_MAX = 400, PUB_CACHE_TTL_MS = 10 * 60 * 1000;
+const pubCache = new Map();      // Kanal -> { rows (aufsteigend), loadedAt }
+const pubInsertCount = new Map();
+
+function pubRowOut(r) {
+    return { id: Number(r.id), senderId: r.sender_commander_id ? Number(r.sender_commander_id) : 0, senderName: r.sender_name || '', avatar: r.avatar_index || 0, text: r.text || '',
+        textEn: r.text_en || '', kind: r.kind, unverified: !!r.unverified, reportId: r.report_id || '', createdAt: r.created_at };
+}
+async function pubRows(channel) {
+    const c = pubCache.get(channel);
+    if (c && Date.now() - c.loadedAt < PUB_CACHE_TTL_MS) return c.rows;
+    const r = await pool.query('SELECT id, sender_commander_id, sender_name, avatar_index, text, text_en, kind, unverified, report_id, created_at FROM public_chat WHERE channel = $1 ORDER BY id DESC LIMIT $2', [channel, PUB_CACHE_MAX]);
+    const rows = r.rows.reverse().map(pubRowOut);
+    pubCache.set(channel, { rows, loadedAt: Date.now() });
+    return rows;
+}
+async function pubInsert(channel, f) {
+    const r = await pool.query('INSERT INTO public_chat (channel, sender_commander_id, sender_name, avatar_index, text, text_en, kind, unverified, report_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, created_at',
+        [channel, f.senderId || null, f.senderName || '', f.avatar || 0, f.text, f.textEn || '', f.kind || 'msg', !!f.unverified, f.reportId || null]);
+    const row = pubRowOut({ id: r.rows[0].id, sender_commander_id: f.senderId || null, sender_name: f.senderName || '', avatar_index: f.avatar || 0, text: f.text, text_en: f.textEn || '', kind: f.kind || 'msg',
+        unverified: f.unverified, report_id: f.reportId || null, created_at: r.rows[0].created_at });
+    const c = pubCache.get(channel);
+    if (c) { c.rows.push(row); if (c.rows.length > PUB_CACHE_MAX) c.rows.splice(0, c.rows.length - PUB_CACHE_MAX); }
+    const n = (pubInsertCount.get(channel) || 0) + 1;
+    pubInsertCount.set(channel, n);
+    if (n % 25 === 0) {   // alle 25 Zeilen: Altes in der Datenbank abschneiden
+        try { await pool.query('DELETE FROM public_chat WHERE channel = $1 AND id < COALESCE((SELECT MIN(id) FROM (SELECT id FROM public_chat WHERE channel = $1 ORDER BY id DESC LIMIT $2) t), 0)', [channel, PUB_CHANNELS[channel] ? PUB_CHANNELS[channel].keep * 2 : 300]); }
+        catch (e) { console.error('[Chat] Abschneiden fehlgeschlagen:', e.message); }
+    }
+    return row;
+}
+function pubFail(res, code, error) { return res.status(code).json({ success: false, error }); }
+function pubChannel(req) { const ch = parseInt(req.params.channel, 10); return PUB_CHANNELS[ch] ? ch : -1; }
+
+app.get('/chat/:channel', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const ch = pubChannel(req); if (ch < 0) return pubFail(res, 400, 'Ungültiger Kanal.');
+    const since = parseInt(req.query.since, 10) || 0;
+    try {
+        const rows = await pubRows(ch);
+        const out = since > 0 ? rows.filter(r => r.id > since).slice(0, 200) : rows.slice(-100);
+        res.json({ success: true, messages: out });
+    } catch (e) { console.error('[Chat] lesen:', e.message); pubFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.post('/chat/:channel', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const ch = pubChannel(req); if (ch < 0) return pubFail(res, 400, 'Ungültiger Kanal.');
+    const me = Number(caller.commanderId), isAdmin = ADMIN_COMMANDER_IDS.includes(me);
+    let text = String((req.body && req.body.text) || '').replace(/[<>\u0000-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '').replace(/\s+/g, ' ').trim();
+    if (!text) return pubFail(res, 400, 'Nachricht fehlt.');
+    if (text.length > PUB_MAX_TEXT) return pubFail(res, 400, 'Ungültige Nachricht (zu lang).');
+    const reportId = /^(CR|CHARTER)-[A-Za-z0-9\-]{1,60}$/.test(String((req.body && req.body.reportId) || '')) ? String(req.body.reportId) : '';
+    try {
+        if (PUB_CHANNELS[ch].adminOnly && !isAdmin) return pubFail(res, 403, 'Dieser Kanal ist nur für Administratoren.');
+        if (!isAdmin) {
+            const mute = await pool.query('SELECT until FROM chat_mutes WHERE commander_id = $1 AND until > now()', [me]);
+            if (mute.rows.length) return pubFail(res, 403, 'Du wurdest vom Support stummgeschaltet.' + muteUntilText(mute.rows[0].until));
+        }
+        let unverified = false;
+        if (EMAIL_GATE_ON && !isAdmin) { try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; } }
+        if (unverified && text.length > PUB_UNVERIFIED_MAX)
+            return pubFail(res, 400, 'Ohne bestätigte E-Mail-Adresse sind nur kurze Nachrichten möglich (höchstens ' + PUB_UNVERIFIED_MAX + ' Zeichen).');
+        if (rateLimited('pubgap|' + caller.playFabId, 1, unverified ? PUB_UNVERIFIED_GAP_MS : PUB_GAP_MS))
+            return pubFail(res, 429, unverified ? 'Ohne bestätigte E-Mail-Adresse kannst du nur alle ' + (PUB_UNVERIFIED_GAP_MS / 1000) + ' Sekunden schreiben.' : 'Bitte nicht so schnell schreiben.');
+        let masked = false;
+        const wf = wordFilterMask(text);
+        if (wf.hits > 0) { text = wf.text; masked = true; }
+        const hs = (await pool.query('SELECT commander_name, avatar_index FROM commander_highscore WHERE commander_id = $1', [me])).rows[0];
+        const name = cleanDisplayName(hs && hs.commander_name) || ('Commander' + me);
+        const row = await pubInsert(ch, { senderId: me, senderName: name, avatar: hs ? (hs.avatar_index || 0) : 0, text, kind: 'msg', unverified, reportId });
+        res.json({ success: true, id: row.id, masked, text });
+    } catch (e) { console.error('[Chat] schreiben:', e.message); pubFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.post('/chat/:channel/delete', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const ch = pubChannel(req); if (ch < 0) return pubFail(res, 400, 'Ungültiger Kanal.');
+    const me = Number(caller.commanderId), id = parseInt(req.body && req.body.id, 10);
+    if (!id) return pubFail(res, 400, 'Ungültige Nachricht.');
+    try {
+        const row = (await pool.query('SELECT id, sender_commander_id, kind FROM public_chat WHERE id = $1 AND channel = $2', [id, ch])).rows[0];
+        if (!row || (row.kind !== 'msg' && row.kind !== 'agi')) return pubFail(res, 404, 'Zeile nicht gefunden.');
+        const own = row.kind === 'msg' && Number(row.sender_commander_id) === me;
+        if (!own && !ADMIN_COMMANDER_IDS.includes(me)) return pubFail(res, 403, 'Du kannst nur deine eigenen Nachrichten löschen.');
+        const c = pubCache.get(ch);
+        if (own) {
+            await pool.query("UPDATE public_chat SET kind = 'deleted', text = '', text_en = '' WHERE id = $1", [id]);
+            if (c) { const r = c.rows.find(x => x.id === id); if (r) { r.kind = 'deleted'; r.text = ''; r.textEn = ''; } }
+        } else {
+            await pool.query('DELETE FROM public_chat WHERE id = $1', [id]);
+            if (c) { const i = c.rows.findIndex(x => x.id === id); if (i >= 0) c.rows.splice(i, 1); }
+        }
+        await pubInsert(ch, { senderId: 0, senderName: '', text: (own ? 's' : '') + id, kind: 'delete' });   // Marke fuer schon geladene Clients
+        res.json({ success: true, own });
+    } catch (e) { console.error('[Chat] loeschen:', e.message); pubFail(res, 500, 'Interner Serverfehler.'); }
+});
+// PUBCHAT55-ENDE
+
 
 
 // #####################################################################
@@ -5842,7 +6127,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages', 'public_chat'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -5950,14 +6235,9 @@ app.get('/admin/reports', async (req, res) => {
 // -------------------------------------------------------
 // PlayFab Server API Hilfsfunktion
 // -------------------------------------------------------
-async function playfabServer(endpoint, data) {
-    const response = await axios.post(`${PLAYFAB_BASE_URL}${endpoint}`, data, {
-        headers: {
-            'Content-Type': 'application/json',
-            'X-SecretKey': PLAYFAB_SECRET
-        }
-    });
-    return response.data.data;
+// NEU 07.11.2026 (§56): alle PlayFab-Aufrufe laufen durch das Tor pfCall (gleichzeitige Aufrufe begrenzt, 429 wird abgewartet, Registrierung/Anmeldung zuerst)
+async function playfabServer(endpoint, data, prio) {
+    return pfCall(endpoint, data, prio, 20000);
 }
 
 // #####################################################################
@@ -8337,6 +8617,9 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             const dmRows = await client.query('DELETE FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1', [commanderId]);   // NEU 07.11.2026 (§53): Privatnachrichten (gesendet und empfangen)
             summary.privateMessagesDeleted = dmRows.rowCount;
             await client.query('DELETE FROM dm_reads WHERE commander_id = $1 OR other_id = $1', [commanderId]);
+            const pubRows2 = await client.query('DELETE FROM public_chat WHERE sender_commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§55): Zeilen in Global/Handel/Event
+            summary.publicChatDeleted = pubRows2.rowCount;
+            if (typeof pubCache !== 'undefined') pubCache.clear();
             await client.query('DELETE FROM alliance_chat_mutes WHERE commander_id = $1', [commanderId]);
         }
 
@@ -14141,6 +14424,7 @@ app.get('/account/export', async (req, res) => {
             tagesaufgaben_abgeholt:  await part('SELECT * FROM daily_quest_state WHERE commander_id = $1 ORDER BY claimed_at DESC', [id], 300),
             tagesaufgaben_ereignisse: await part('SELECT * FROM daily_events WHERE commander_id = $1 ORDER BY created_at DESC', [id], 300),
             planeten:                await part('SELECT * FROM planet_registry WHERE owner_commander_id = $1', [id]),
+            oeffentliche_chats:      await part('SELECT id, channel, text, kind, created_at FROM public_chat WHERE sender_commander_id = $1 ORDER BY id DESC', [id], 2000),
             private_nachrichten:     await part('SELECT id, sender_id, recipient_id, text, kind, created_at FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1 ORDER BY id DESC', [id], 2000),
             geschenkkisten:          await part('SELECT * FROM giftbox_claims WHERE playfab_id = $1', [pf]),
             geraete_angemeldet_bleiben: await part('SELECT created_at, last_used_at, expires_at FROM remember_tokens WHERE playfab_id = $1 ORDER BY created_at DESC', [pf], 20)
@@ -14163,7 +14447,7 @@ app.get('/account/export', async (req, res) => {
             highscore: 'Rangliste (Punkte)', beziehungen: 'Beziehungen zu anderen Spielern', allianz_mitgliedschaft: 'Allianz-Mitgliedschaft',
             allianz_bewerbungen: 'Allianz-Bewerbungen', allianzkasse_buchungen: 'Buchungen in der Allianzkasse', handel_angebote: 'Handelsangebote',
             transporte: 'Transporte', stationierte_flotten: 'Stationierte Flotten', kaempfe_uebersicht: 'Kämpfe (Übersicht)', piratenangriffe: 'Piratenangriffe',
-            erfolge: 'Erfolge', tagesaufgaben_abgeholt: 'Abgeholte Tagesaufgaben', tagesaufgaben_ereignisse: 'Tagesaufgaben-Ereignisse', planeten: 'Planeten', private_nachrichten: 'Private Nachrichten',
+            erfolge: 'Erfolge', tagesaufgaben_abgeholt: 'Abgeholte Tagesaufgaben', tagesaufgaben_ereignisse: 'Tagesaufgaben-Ereignisse', planeten: 'Planeten', private_nachrichten: 'Private Nachrichten', oeffentliche_chats: 'Zeilen in Global-/Handels-/Event-Chat',
             geschenkkisten: 'Geschenkkisten', geraete_angemeldet_bleiben: 'Geräte mit "Angemeldet bleiben"'
         };
         const lines = ['DEINE GESPEICHERTEN DATEN', 'Stand: ' + out.erstellt_am.replace('T', ' ').slice(0, 16) + ' UTC', '',
