@@ -1224,6 +1224,8 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
         // NEU 07.11.2026 (Anwerben): Angebots-Verweis (OFFER-<Trade-ID>) in Allianz- und Privatnachrichten (oeffentliche Chats haben report_id)
         await pool.query(`ALTER TABLE alliance_chat ADD COLUMN IF NOT EXISTS ref TEXT;`);
+        // NEU 07.11.2026 (§57): Heimatplanet je Commander (Wechsel fruehestens alle 48 h, Schutz vor Invasion/Sprengung ist fuer spaeter vorgesehen)
+        await pool.query(`CREATE TABLE IF NOT EXISTS commander_home (commander_id INTEGER PRIMARY KEY, coord TEXT NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         // NEU 07.11.2026 (§53/§54): Privatnachrichten, Lesemarken, AGI-Aitan-Nachrichten
         await pool.query(`CREATE TABLE IF NOT EXISTS dm_messages (id BIGSERIAL PRIMARY KEY, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
@@ -4763,6 +4765,54 @@ async function chatOfferRef(raw, commanderId) {
 }
 // OFFERREF-ENDE
 
+// #####################################################################
+// §57  HEIMATPLANET (07.11.2026, Nutzerwunsch): Jeder Commander hat eine Heimat (Kolonienliste im Commander-Fenster, "als Heimat markieren").
+//      - Wechsel fruehestens alle 48 Stunden (Server entscheidet: Tabelle commander_home, Zeitpunkt des letzten Wechsels; der ERSTE Wechsel ist frei).
+//      - Die Heimat muss dem Commander gehoeren (planet_registry), darf nicht gerade terraformen.
+//      - Spaeter: die Heimat ist vor Invasion und Sprengung geschuetzt (homeCoordOf(commanderId) ist dafuer vorbereitet, noch nirgends benutzt).
+//      - Der Client meldet jeden Wechsel hier an (POST /home/set) und uebernimmt ihn nur bei "success"; GET /home/status liefert Heimat + Sperrzeit.
+// #####################################################################
+// HOME57-START
+const HOME_CHANGE_HOURS = 48;
+
+function homeFail(res, code, error, extra) { return res.status(code).json(Object.assign({ success: false, error }, extra || {})); }
+function homeWaitText(seconds) { const m = Math.ceil(seconds / 60); return Math.floor(m / 60) + ' Std. ' + (m % 60) + ' Min.'; }
+
+// Heimat-Koordinate eines Commanders laut Server ('' = noch nie gesetzt/gewechselt -> die Heimat steht nur im Spielstand des Spielers)
+async function homeCoordOf(commanderId) {
+    const r = await pool.query('SELECT coord FROM commander_home WHERE commander_id = $1', [Number(commanderId)]);
+    return r.rows.length ? String(r.rows[0].coord) : '';
+}
+
+app.get('/home/status', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    try {
+        const r = await pool.query('SELECT coord, GREATEST(0, EXTRACT(EPOCH FROM (changed_at + make_interval(hours => $2) - now())))::int AS wait FROM commander_home WHERE commander_id = $1', [Number(caller.commanderId), HOME_CHANGE_HOURS]);
+        if (!r.rows.length) return res.json({ success: true, coord: '', waitSeconds: 0 });
+        res.json({ success: true, coord: String(r.rows[0].coord), waitSeconds: r.rows[0].wait });
+    } catch (e) { console.error('[Heimat] Status:', e.message); homeFail(res, 500, 'Interner Serverfehler.'); }
+});
+
+app.post('/home/set', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const me = Number(caller.commanderId);
+    const coord = normalizeRegistryCoord(req.body && req.body.coord);
+    if (!coord) return homeFail(res, 400, 'Ungültige Koordinate.');
+    try {
+        const own = await pool.query("SELECT terraform_until FROM planet_registry WHERE coord = $1 AND owner_commander_id = $2 AND kind = 'player'", [coord, me]);
+        if (!own.rows.length) return homeFail(res, 403, 'Dieser Planet gehört dir nicht.');
+        if (own.rows[0].terraform_until && new Date(own.rows[0].terraform_until) > new Date()) return homeFail(res, 400, 'Ein Planet im Terraforming kann nicht Heimat werden.');
+        const cur = await pool.query('SELECT coord, GREATEST(0, EXTRACT(EPOCH FROM (changed_at + make_interval(hours => $2) - now())))::int AS wait FROM commander_home WHERE commander_id = $1', [me, HOME_CHANGE_HOURS]);
+        if (cur.rows.length && String(cur.rows[0].coord) === coord) return res.json({ success: true, coord, waitSeconds: cur.rows[0].wait, unchanged: true });
+        if (cur.rows.length && cur.rows[0].wait > 0)
+            return homeFail(res, 429, 'Die Heimat kann erst in ' + homeWaitText(cur.rows[0].wait) + ' gewechselt werden.', { waitSeconds: cur.rows[0].wait });
+        await pool.query('INSERT INTO commander_home (commander_id, coord, changed_at) VALUES ($1, $2, now()) ON CONFLICT (commander_id) DO UPDATE SET coord = EXCLUDED.coord, changed_at = now()', [me, coord]);
+        console.log('[Heimat] Commander ' + me + ' -> ' + coord);
+        res.json({ success: true, coord, waitSeconds: HOME_CHANGE_HOURS * 3600 });
+    } catch (e) { console.error('[Heimat] Setzen:', e.message); homeFail(res, 500, 'Interner Serverfehler.'); }
+});
+// HOME57-ENDE
+
 // ALLIANCECHAT49-START
 const ALLIANCE_CHAT_KEEP = 200, ALLIANCE_CHAT_MAX_TEXT = 80, ALLIANCE_CHAT_UNVERIFIED_MAX = 30;
 const ALLIANCE_CHAT_GAP_MS = 1500, ALLIANCE_CHAT_UNVERIFIED_GAP_MS = 15000;
@@ -6178,7 +6228,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages', 'public_chat'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'commander_home', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages', 'public_chat'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -8664,6 +8714,7 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             const blockRows = await client.query('DELETE FROM player_blocks WHERE blocker_commander_id = $1 OR blocked_commander_id = $1', [commanderId]);
             summary.blocksDeleted = blockRows.rowCount;
             await client.query('DELETE FROM account_language WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§51)
+            await client.query('DELETE FROM commander_home WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§57)
             await client.query('DELETE FROM chat_mutes WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§52)
             const dmRows = await client.query('DELETE FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1', [commanderId]);   // NEU 07.11.2026 (§53): Privatnachrichten (gesendet und empfangen)
             summary.privateMessagesDeleted = dmRows.rowCount;
@@ -10180,12 +10231,12 @@ function marketPriceBounds(kind, index, amount, priceResource) {
 
 // NEU 07.11.2026 (Nutzerwunsch): LIEFERZEIT gekaufter Schiffe. Mindestens 3 Stunden, je Sektor Entfernung zwischen dem Sektor des Verkaeufers und dem
 // Zielplaneten des Kaeufers kommen 2 Stunden dazu (gleicher Sektor = 3 h, drei Sektoren weiter = 9 h) - so wird lokaler Handel lukrativer.
-// Eine andere Galaxie zaehlt wie MARKET_DELIVERY_GALAXY_SECTORS Sektoren je Galaxie Abstand. Ressourcen kommen weiter sofort (nur Schiffe liefern mit Verzoegerung;
-// die Arten stehen in MARKET_DELIVERY_KINDS). Bezahlt wird sofort, das Schiff kommt erst bei Ankunft auf den Zielplaneten (POST /market/deliver, Aufrufer = Kaeufer).
+// Eine andere Galaxie zaehlt wie MARKET_DELIVERY_GALAXY_SECTORS Sektoren je Galaxie Abstand (es gibt vorerst nur Galaxie 1). Seit 07.11.2026 (Nutzer: "jeder Kauf braucht mindestens 3 h, auch Ressourcen")
+// gilt die Lieferzeit fuer ALLE Waren des Spielerhandels (die Arten stehen in MARKET_DELIVERY_KINDS). Bezahlt wird sofort, die Ware kommt erst bei Ankunft auf den Zielplaneten (POST /market/deliver, Aufrufer = Kaeufer).
 const MARKET_DELIVERY_BASE_HOURS       = 3;
 const MARKET_DELIVERY_PER_SECTOR_HOURS = 2;
 const MARKET_DELIVERY_GALAXY_SECTORS   = 5;
-const MARKET_DELIVERY_KINDS            = ['warship', 'ship'];
+const MARKET_DELIVERY_KINDS            = ['resource', 'warship', 'ship'];
 
 function marketCoordParts(coord) {
     const m = /^(\d+):(\d+):(\d+):(\d+)$/.exec(String(coord || ''));
