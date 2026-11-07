@@ -169,7 +169,8 @@ const AUTH_POLICY = [
     ['POST', /^\/admin\/inventory\/grant$/,    'admin'],
     ['*',    /^\/admin\/galaxy\/.+/,          'admin'],    // NEU 18.10.2026 (§30)
     ['*',    /^\/alliances\/admin\/.+/,        'admin'],
-    ['POST', /^\/alliances\/\d+\/chat\/\d+\/delete$/, 'admin'],   // NEU 07.11.2026 (§51): Admin loescht eine Allianzchat-Zeile
+    ['POST', /^\/chat-admin\/.+/,            'admin'],   // NEU 07.11.2026 (§52): Admin schaltet einen Spieler stumm
+    // Allianzchat-Zeile loeschen (§51) und Allianz-Optionen (§52): Standard 'player' - der Handler prueft selbst (Admin oder Gruender dieser Allianz)
     ['PUT',  /^\/legal-texts\/.+/,             'admin'],
     ['GET',  /^\/supportMessages$/,            'admin'],
     ['POST', /^\/announcements$/,              'admin'],
@@ -1051,7 +1052,13 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE, sender_commander_id INTEGER, sender_name TEXT NOT NULL DEFAULT '',
             text TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_alliance_chat_alliance ON alliance_chat (alliance_id, id);`);
-        await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);   // NEU 07.11.2026 (§51): gewaehlte Sprache je Konto (gilt auf jedem Geraet)
+        await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        // NEU 07.11.2026 (§52): Stummschalten, Allianz-Chat-Einstellungen, Kontext-Protokoll, Verweis auf die gemeldete Chat-Zeile
+        await pool.query(`CREATE TABLE IF NOT EXISTS chat_mutes (commander_id INTEGER PRIMARY KEY, until TIMESTAMPTZ NOT NULL, by_commander_id INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat_settings (alliance_id INTEGER PRIMARY KEY REFERENCES alliances(id) ON DELETE CASCADE, chat_enabled BOOLEAN NOT NULL DEFAULT true, muted_until TIMESTAMPTZ);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS alliance_chat_mutes (alliance_id INTEGER NOT NULL REFERENCES alliances(id) ON DELETE CASCADE, commander_id INTEGER NOT NULL, until TIMESTAMPTZ NOT NULL, by_commander_id INTEGER, PRIMARY KEY (alliance_id, commander_id));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS report_context_log (id SERIAL PRIMARY KEY, report_id INTEGER, admin_commander_id INTEGER, alliance_id INTEGER, row_id INTEGER, lines INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`ALTER TABLE player_reports ADD COLUMN IF NOT EXISTS context_ref TEXT NOT NULL DEFAULT '';`);   // NEU 07.11.2026 (§51): gewaehlte Sprache je Konto (gilt auf jedem Geraet)
 
         // -------------------------------------------------------
         // NEU (13.09.): Virgo-Shop-Artikelkatalog. Bewusst in Postgres,
@@ -4007,7 +4014,8 @@ app.post('/report-player', async (req, res) => {
     const reportedId = parseInt(req.body?.reportedCommanderId, 10);
     const reason = req.body?.reason;
     const message = String(req.body?.message || '').slice(0, 1000);
-    const context = String(req.body?.context || '').replace(/[<>]/g, '').slice(0, 300);   // 01.11.2026 (§50): angeklickte Chat-Zeile als Beleg (vom Melder, nicht pruefbar - nur Hinweis fuer den Admin)
+    const context = String(req.body?.context || '').replace(/[<>]/g, '').slice(0, 300);
+    const refMatch = /^A:(\d+):(\d+)$/.exec(String(req.body?.contextRef || ''));   // NEU 07.11.2026 (§52): Verweis auf die gemeldete Allianzchat-Zeile (wird unten geprueft)   // 01.11.2026 (§50): angeklickte Chat-Zeile als Beleg (vom Melder, nicht pruefbar - nur Hinweis fuer den Admin)
 
     if (!reporterId || !reportedId)
         return res.status(400).json({ success: false, error: 'Ungültige Commander-ID.' });
@@ -4029,10 +4037,19 @@ app.post('/report-player', async (req, res) => {
         if (recent.rows.length > 0)
             return res.status(429).json({ success: false, error: 'Du hast diesen Spieler gerade erst gemeldet. Bitte warte ein paar Minuten.' });
 
+        let contextRef = '';
+        if (refMatch) {   // nur uebernehmen, wenn der Melder Mitglied der Allianz ist und die Zeile wirklich vom Gemeldeten stammt (sonst stillschweigend ohne Verweis)
+            try {
+                const aId = parseInt(refMatch[1], 10), rId = parseInt(refMatch[2], 10);
+                const mem = await pool.query('SELECT 1 FROM alliance_members WHERE alliance_id = $1 AND commander_id = $2', [aId, reporterId]);
+                const row = mem.rows.length ? await pool.query("SELECT 1 FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND sender_commander_id = $3 AND kind = 'msg'", [rId, aId, reportedId]) : { rows: [] };
+                if (row.rows.length) contextRef = 'A:' + aId + ':' + rId;
+            } catch (e) { contextRef = ''; }
+        }
         await pool.query(
-            `INSERT INTO player_reports (reporter_commander_id, reported_commander_id, reason, message, context)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [reporterId, reportedId, reason, message, context]);
+            `INSERT INTO player_reports (reporter_commander_id, reported_commander_id, reason, message, context, context_ref)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [reporterId, reportedId, reason, message, context, contextRef]);
     } catch (error) {
         console.error('[Server] report-player Fehler (Speichern):', error.message);
         return res.status(500).json({ success: false, error: 'Interner Serverfehler.' });
@@ -4569,12 +4586,14 @@ app.get('/alliances/:id/chat', async (req, res) => {
     if (!id) return res.status(400).json({ success: false, error: 'Ungültige Allianz.' });
     try {
         if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
+        const st = await allianceChatState(id, caller.commanderId);   // NEU 07.11.2026 (§52)
+        if (!st.enabled) return res.json({ success: true, chatEnabled: false, isFounder: st.isFounder, allMutedUntil: '', youMutedUntil: st.youMutedUntil, messages: [] });
         const cols = 'c.id, c.sender_commander_id, c.sender_name, c.text, c.kind, c.unverified, c.created_at, COALESCE(h.avatar_index, 0) AS avatar, r.name AS rank';   // rank = AKTUELLER Rang des Absenders in dieser Allianz (leer, wenn er nicht mehr Mitglied ist)
         const from = ' FROM alliance_chat c LEFT JOIN commander_highscore h ON h.commander_id = c.sender_commander_id LEFT JOIN alliance_members am ON am.alliance_id = c.alliance_id AND am.commander_id = c.sender_commander_id LEFT JOIN alliance_ranks r ON r.id = am.rank_id WHERE c.alliance_id = $1';
         const r = since > 0
             ? await pool.query('SELECT ' + cols + from + ' AND c.id > $2 ORDER BY c.id ASC LIMIT 200', [id, since])
             : await pool.query('SELECT * FROM (SELECT ' + cols + from + ' ORDER BY c.id DESC LIMIT 100) t ORDER BY t.id ASC', [id]);
-        res.json({ success: true, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
+        res.json({ success: true, chatEnabled: true, isFounder: st.isFounder, allMutedUntil: st.allMutedUntil, youMutedUntil: st.youMutedUntil, messages: r.rows.map(m => ({ id: m.id, senderId: m.sender_commander_id || 0, senderName: m.sender_name, avatar: m.avatar || 0, rank: m.rank || '', text: m.text, kind: m.kind, unverified: !!m.unverified, createdAt: m.created_at })) });
     } catch (e) { console.error('[Allianzchat] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
 });
 
@@ -4586,6 +4605,8 @@ app.post('/alliances/:id/chat', async (req, res) => {
     if (text.length > ALLIANCE_CHAT_MAX_TEXT) return res.status(400).json({ success: false, error: 'Ungültige Nachricht (zu lang).' });
     try {
         if (!(await allianceChatIsMember(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur Mitglieder dieser Allianz.' });
+        const gate = await allianceChatGate(id, caller.commanderId);   // NEU 07.11.2026 (§52): stumm / Chat aus
+        if (gate) return res.status(gate.code).json({ success: false, error: gate.error });
         let unverified = false;
         if (EMAIL_GATE_ON && !ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) {
             try { unverified = !(await emailVerifiedFor(caller.playFabId)); } catch (e) { unverified = false; }   // Pruefung nicht moeglich: nicht bestrafen
@@ -4678,11 +4699,11 @@ app.get('/support/inbox', async (req, res) => {
     if (!inboxIsAdmin(caller)) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
     try {
         const live = await pool.query(`SELECT * FROM support_chats WHERE status <> 'closed' ORDER BY (status = 'waiting') DESC, created_at ASC LIMIT $1`, [INBOX_LIMIT]);
-        const reps = await pool.query(`SELECT r.id, r.reporter_commander_id, r.reported_commander_id, r.reason, r.message, r.context, r.created_at, COALESCE(a.commander_name, '') AS reporter_name, COALESCE(b.commander_name, '') AS reported_name FROM player_reports r LEFT JOIN commander_highscore a ON a.commander_id = r.reporter_commander_id LEFT JOIN commander_highscore b ON b.commander_id = r.reported_commander_id WHERE r.status = 'new' ORDER BY r.created_at ASC LIMIT $1`, [INBOX_LIMIT]);
+        const reps = await pool.query(`SELECT r.id, r.reporter_commander_id, r.reported_commander_id, r.reason, r.message, r.context, r.context_ref, r.created_at, COALESCE(a.commander_name, '') AS reporter_name, COALESCE(b.commander_name, '') AS reported_name FROM player_reports r LEFT JOIN commander_highscore a ON a.commander_id = r.reporter_commander_id LEFT JOIN commander_highscore b ON b.commander_id = r.reported_commander_id WHERE r.status = 'new' ORDER BY r.created_at ASC LIMIT $1`, [INBOX_LIMIT]);
         const forms = await pool.query(`SELECT id, sender_commander_id, sender_name, message, status, created_at FROM support_messages WHERE status IN ('new', 'read') ORDER BY created_at ASC LIMIT $1`, [INBOX_LIMIT]);
         const items = [];
         live.rows.forEach(c => items.push({ kind: 'live', id: c.id, name: c.name, commanderId: c.commander_id, text: c.topic, status: c.status, unverified: !!c.unverified, adminCommanderId: c.admin_commander_id || 0, createdAt: c.created_at }));
-        reps.rows.forEach(x => items.push({ kind: 'report', id: x.id, name: x.reported_name || ('Commander #' + x.reported_commander_id), commanderId: x.reported_commander_id, reporterId: x.reporter_commander_id, reporterName: x.reporter_name || ('Commander #' + x.reporter_commander_id), reason: x.reason, text: x.message, context: x.context || '', status: 'new', createdAt: x.created_at }));
+        reps.rows.forEach(x => items.push({ kind: 'report', id: x.id, name: x.reported_name || ('Commander #' + x.reported_commander_id), commanderId: x.reported_commander_id, reporterId: x.reporter_commander_id, reporterName: x.reporter_name || ('Commander #' + x.reporter_commander_id), reason: x.reason, text: x.message, context: x.context || '', contextRef: x.context_ref || '', status: 'new', createdAt: x.created_at }));
         forms.rows.forEach(f => items.push({ kind: 'form', id: f.id, name: f.sender_name || 'unbekannt', commanderId: f.sender_commander_id || 0, text: f.message, status: f.status, createdAt: f.created_at }));
         res.json({ success: true, items });
     } catch (e) { console.error('[Eingang] liste:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
@@ -4791,7 +4812,7 @@ app.post('/support/inbox/form/:id/done', async (req, res) => {
 // #####################################################################
 // SPRACHE51-START
 const ACCOUNT_LANGS = ['de', 'en'];
-const RETENTION_DONE_DAYS = 180, RETENTION_NEW_DAYS = 365;
+const RETENTION_DONE_DAYS = 90, RETENTION_NEW_DAYS = 90, CHAT_RETENTION_DAYS = 90;   // Nutzer 07.11.2026: nichts laenger als 90 Tage (Support, Meldungen, Allianzchat)
 
 app.get('/account/language', async (req, res) => {
     const caller = await requireCaller(req, res); if (!caller) return;
@@ -4813,10 +4834,10 @@ app.post('/account/language', async (req, res) => {
 
 app.post('/alliances/:id/chat/:msgId/delete', async (req, res) => {
     const caller = await requireCaller(req, res); if (!caller) return;
-    if (!ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return res.status(403).json({ success: false, error: 'Nur für Administratoren.' });
     const id = parseInt(req.params.id, 10), msgId = parseInt(req.params.msgId, 10);
     if (!id || !msgId) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
     try {
+        if (!(await allianceCanModerate(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur der Allianzgründer.' });   // §52: Admin oder Gründer dieser Allianz
         const d = await pool.query("DELETE FROM alliance_chat WHERE id = $1 AND alliance_id = $2 AND kind <> 'delete'", [msgId, id]);
         if (!d.rowCount) return res.status(404).json({ success: false, error: 'Zeile nicht gefunden.' });
         await pool.query("INSERT INTO alliance_chat (alliance_id, sender_commander_id, sender_name, text, kind) VALUES ($1, NULL, '', $2, 'delete')", [id, String(msgId)]);
@@ -4831,8 +4852,12 @@ async function retentionMaintain() {
     try {
         const a = await pool.query("DELETE FROM support_messages WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
         const b = await pool.query("DELETE FROM player_reports WHERE (status <> 'new' AND created_at < now() - $1::interval) OR created_at < now() - $2::interval", [RETENTION_DONE_DAYS + ' days', RETENTION_NEW_DAYS + ' days']);
-        if (a.rowCount || b.rowCount) console.log('[Aufbewahrung] gelöscht: Support-Nachrichten ' + a.rowCount + ', Meldungen ' + b.rowCount);
-        return { messages: a.rowCount, reports: b.rowCount };
+        const c = await pool.query('DELETE FROM alliance_chat WHERE created_at < now() - $1::interval', [CHAT_RETENTION_DAYS + ' days']);
+        await pool.query('DELETE FROM chat_mutes WHERE until < now()');
+        await pool.query('DELETE FROM alliance_chat_mutes WHERE until < now()');
+        await pool.query('DELETE FROM report_context_log WHERE created_at < now() - $1::interval', [RETENTION_DONE_DAYS + ' days']);
+        if (a.rowCount || b.rowCount || c.rowCount) console.log('[Aufbewahrung] gelöscht: Support-Nachrichten ' + a.rowCount + ', Meldungen ' + b.rowCount + ', Allianzchat-Zeilen ' + c.rowCount);
+        return { messages: a.rowCount, reports: b.rowCount, chat: c.rowCount };
     } catch (e) { console.error('[Aufbewahrung] Fehler:', e.message); return null; }
 }
 if (typeof setTimeout === 'function' && process.env.NODE_ENV !== 'test') {
@@ -4840,6 +4865,164 @@ if (typeof setTimeout === 'function' && process.env.NODE_ENV !== 'test') {
     if (t1.unref) t1.unref();
 }
 // SPRACHE51-ENDE
+
+// #####################################################################
+// §52  STUMMSCHALTEN, ALLIANZ-OPTIONEN, KONTEXT ANSEHEN (07.11.2026, Nutzer-Entscheidungen)
+//      Admin: einen Spieler STUMM schalten (POST /chat-admin/mute): gilt im Allianzchat (hier) und in Global/Handel/Event (PlayFab-Internal-Data
+//      "chatMutedUntil", vom CloudScript beim Senden geprueft). Stunden 0 = aufheben.
+//      Allianzgruender (und Admin): Mitglieder stumm schalten, den GANZEN Chat stumm schalten (nur der Gruender darf noch schreiben) oder den
+//      Allianzchat komplett abschalten (Routen unter /alliances/:id/chat-admin). Gruender duerfen ausserdem Zeilen im eigenen Allianzchat loeschen.
+//      Kontext ansehen: Admin sieht zu einer OFFENEN Meldung aus dem Allianzchat hoechstens 30 Zeilen um die gemeldete Zeile; jeder Blick wird
+//      protokolliert (report_context_log). Der Melder liefert nur einen Verweis (contextRef "A:<Allianz>:<Zeile>"), der Server prueft beim Melden,
+//      dass der Melder Mitglied ist und die Zeile vom Gemeldeten stammt.
+// #####################################################################
+// SCHUTZ52-START
+const MUTE_MAX_HOURS = 24 * 30, CONTEXT_LINES_BEFORE = 15, CONTEXT_LINES_AFTER = 14;
+
+function muteUntilText(until) {
+    const min = Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 60000));
+    return min >= 120 ? ' (noch ' + Math.ceil(min / 60) + ' Std.)' : ' (noch ' + min + ' Min.)';
+}
+function muteHours(v) {
+    const h = Math.floor(Number(v));
+    return Number.isFinite(h) && h >= 0 && h <= MUTE_MAX_HOURS ? h : -1;
+}
+async function allianceFounderOf(allianceId) {
+    const r = await pool.query('SELECT founder_commander_id FROM alliances WHERE id = $1', [allianceId]);
+    return r.rows.length ? Number(r.rows[0].founder_commander_id) : 0;
+}
+// darf dieser Spieler im Allianzchat moderieren? (Admin immer; sonst nur der Gruender dieser Allianz)
+async function allianceCanModerate(commanderId, allianceId) {
+    if (ADMIN_COMMANDER_IDS.includes(Number(commanderId))) return true;
+    const founder = await allianceFounderOf(allianceId);
+    return founder > 0 && founder === Number(commanderId);
+}
+async function allianceChatState(allianceId, commanderId) {
+    const founder = await allianceFounderOf(allianceId);
+    const s = await pool.query('SELECT chat_enabled, muted_until FROM alliance_chat_settings WHERE alliance_id = $1', [allianceId]);
+    const m = await pool.query('SELECT until FROM alliance_chat_mutes WHERE alliance_id = $1 AND commander_id = $2 AND until > now()', [allianceId, commanderId]);
+    const row = s.rows[0];
+    const allMuted = row && row.muted_until && new Date(row.muted_until) > new Date() ? new Date(row.muted_until).toISOString() : '';
+    return { isFounder: founder > 0 && founder === Number(commanderId), enabled: row ? row.chat_enabled !== false : true, allMutedUntil: allMuted,
+        youMutedUntil: m.rows.length ? new Date(m.rows[0].until).toISOString() : '' };
+}
+// Darf dieser Spieler jetzt im Allianzchat schreiben? null = ja, sonst { code, error }
+async function allianceChatGate(allianceId, commanderId) {
+    if (ADMIN_COMMANDER_IDS.includes(Number(commanderId))) return null;
+    const g = await pool.query('SELECT until FROM chat_mutes WHERE commander_id = $1 AND until > now()', [commanderId]);
+    if (g.rows.length) return { code: 403, error: 'Du wurdest vom Support stummgeschaltet.' + muteUntilText(g.rows[0].until) };   // LOCALIZE
+    const st = await allianceChatState(allianceId, commanderId);
+    if (!st.enabled) return { code: 403, error: 'Der Allianzchat ist deaktiviert.' };   // LOCALIZE
+    if (st.isFounder) return null;
+    if (st.allMutedUntil) return { code: 403, error: 'Der Gründer hat den Allianzchat vorübergehend stummgeschaltet.' + muteUntilText(st.allMutedUntil) };   // LOCALIZE
+    if (st.youMutedUntil) return { code: 403, error: 'Du wurdest vom Allianzgründer stummgeschaltet.' + muteUntilText(st.youMutedUntil) };   // LOCALIZE
+    return null;
+}
+
+// ---- Admin: Spieler stumm schalten ----
+app.post('/chat-admin/mute', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return res.status(403).json({ success: false, error: 'Nur für Administratoren.' });
+    const target = parseInt(req.body && req.body.targetCommanderId, 10), hours = muteHours(req.body && req.body.hours);
+    if (!target || target < 1000000 || hours < 0) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    if (ADMIN_COMMANDER_IDS.includes(target)) return res.status(400).json({ success: false, error: 'Administratoren kann man nicht stummschalten.' });
+    try {
+        const t = await stationedLookupCommander(target);
+        if (!t) return res.status(404).json({ success: false, error: 'Spieler nicht gefunden.' });
+        let untilMs = 0;
+        if (hours > 0) {
+            untilMs = Date.now() + hours * 3600000;
+            await pool.query('INSERT INTO chat_mutes (commander_id, until, by_commander_id) VALUES ($1, $2, $3) ON CONFLICT (commander_id) DO UPDATE SET until = EXCLUDED.until, by_commander_id = EXCLUDED.by_commander_id', [target, new Date(untilMs), caller.commanderId]);
+        } else {
+            await pool.query('DELETE FROM chat_mutes WHERE commander_id = $1', [target]);
+        }
+        let publicChat = true;   // Global/Handel/Event: der CloudScript liest "chatMutedUntil" aus den internen Spielerdaten
+        try { await playfabServer('/Server/UpdateUserInternalData', { PlayFabId: t.playFabId, Data: { chatMutedUntil: String(untilMs) } }); }
+        catch (e) { publicChat = false; console.error('[Stumm] PlayFab:', e.message); }
+        console.log('[Stumm] Admin hat einen Spieler ' + (hours > 0 ? 'stummgeschaltet' : 'freigegeben'));
+        res.json({ success: true, name: t.name, hours, until: untilMs ? new Date(untilMs).toISOString() : '', publicChat });
+    } catch (e) { console.error('[Stumm] Fehler:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// ---- Allianz-Optionen (Gruender/Admin) ----
+app.get('/alliances/:id/chat-admin', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Allianz.' });
+    try {
+        if (!(await allianceCanModerate(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur der Allianzgründer.' });
+        const st = await allianceChatState(id, 0);
+        const members = await pool.query('SELECT am.commander_id, am.commander_name, mu.until FROM alliance_members am LEFT JOIN alliance_chat_mutes mu ON mu.alliance_id = am.alliance_id AND mu.commander_id = am.commander_id AND mu.until > now() WHERE am.alliance_id = $1 ORDER BY am.commander_name', [id]);
+        const founder = await allianceFounderOf(id);
+        res.json({ success: true, chatEnabled: st.enabled, allMutedUntil: st.allMutedUntil,
+            members: members.rows.map(m => ({ id: m.commander_id, name: m.commander_name, mutedUntil: m.until ? new Date(m.until).toISOString() : '', isFounder: Number(m.commander_id) === founder })) });
+    } catch (e) { console.error('[Allianzoptionen] lesen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/alliances/:id/chat-admin/mute', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10), target = parseInt(req.body && req.body.commanderId, 10), hours = muteHours(req.body && req.body.hours);
+    if (!id || !target || hours < 0) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    try {
+        if (!(await allianceCanModerate(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur der Allianzgründer.' });
+        if (target === (await allianceFounderOf(id)) || ADMIN_COMMANDER_IDS.includes(target)) return res.status(400).json({ success: false, error: 'Diesen Spieler kann man nicht stummschalten.' });
+        if (!(await allianceChatIsMember(target, id))) return res.status(404).json({ success: false, error: 'Der Spieler ist kein Mitglied.' });
+        if (hours > 0) await pool.query('INSERT INTO alliance_chat_mutes (alliance_id, commander_id, until, by_commander_id) VALUES ($1, $2, $3, $4) ON CONFLICT (alliance_id, commander_id) DO UPDATE SET until = EXCLUDED.until, by_commander_id = EXCLUDED.by_commander_id',
+            [id, target, new Date(Date.now() + hours * 3600000), caller.commanderId]);
+        else await pool.query('DELETE FROM alliance_chat_mutes WHERE alliance_id = $1 AND commander_id = $2', [id, target]);
+        res.json({ success: true, hours });
+    } catch (e) { console.error('[Allianzoptionen] stumm:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+app.post('/alliances/:id/chat-admin/settings', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    const id = parseInt(req.params.id, 10), b = req.body || {};
+    const hasEnabled = typeof b.chatEnabled === 'boolean', hasMute = b.allMutedHours !== undefined && b.allMutedHours !== null;
+    const hours = hasMute ? muteHours(b.allMutedHours) : 0;
+    if (!id || (!hasEnabled && !hasMute) || hours < 0) return res.status(400).json({ success: false, error: 'Ungültige Angaben.' });
+    try {
+        if (!(await allianceCanModerate(caller.commanderId, id))) return res.status(403).json({ success: false, error: 'Nur der Allianzgründer.' });
+        const cur = (await pool.query('SELECT chat_enabled, muted_until FROM alliance_chat_settings WHERE alliance_id = $1', [id])).rows[0];
+        const enabled = hasEnabled ? b.chatEnabled : (cur ? cur.chat_enabled !== false : true);
+        const mutedUntil = hasMute ? (hours > 0 ? new Date(Date.now() + hours * 3600000) : null) : (cur ? cur.muted_until : null);
+        await pool.query('INSERT INTO alliance_chat_settings (alliance_id, chat_enabled, muted_until) VALUES ($1, $2, $3) ON CONFLICT (alliance_id) DO UPDATE SET chat_enabled = EXCLUDED.chat_enabled, muted_until = EXCLUDED.muted_until', [id, enabled, mutedUntil]);
+        if (hasMute) await allianceChatSystem(id, null, '', hours > 0 ? 'Der Gründer hat den Chat für ' + hours + ' Std. stummgeschaltet.' : 'Der Chat ist wieder freigegeben.');   // LOCALIZE
+        res.json({ success: true, chatEnabled: enabled, allMutedUntil: mutedUntil ? new Date(mutedUntil).toISOString() : '' });
+    } catch (e) { console.error('[Allianzoptionen] Einstellungen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// ---- Kontext ansehen (Admin, nur offene Meldung aus dem Allianzchat, hoechstens 30 Zeilen, protokolliert) ----
+app.post('/support/inbox/report/:id/context', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ success: false, error: 'Ungültige Meldung.' });
+    try {
+        const rep = (await pool.query("SELECT id, context_ref, status FROM player_reports WHERE id = $1", [id])).rows[0];
+        if (!rep) return res.status(404).json({ success: false, error: 'Meldung nicht gefunden.' });
+        if (rep.status !== 'new') return res.status(409).json({ success: false, error: 'Die Meldung ist schon erledigt - der Kontext ist nur bei offenen Meldungen abrufbar.' });
+        const m = /^A:(\d+):(\d+)$/.exec(String(rep.context_ref || ''));
+        if (!m) return res.status(404).json({ success: false, error: 'Zu dieser Meldung gibt es keinen Chat-Verweis.' });
+        const allianceId = parseInt(m[1], 10), rowId = parseInt(m[2], 10);
+        const before = await pool.query("SELECT id, sender_commander_id, sender_name, text, created_at FROM alliance_chat WHERE alliance_id = $1 AND id <= $2 AND kind = 'msg' ORDER BY id DESC LIMIT $3", [allianceId, rowId, CONTEXT_LINES_BEFORE + 1]);
+        const after = await pool.query("SELECT id, sender_commander_id, sender_name, text, created_at FROM alliance_chat WHERE alliance_id = $1 AND id > $2 AND kind = 'msg' ORDER BY id ASC LIMIT $3", [allianceId, rowId, CONTEXT_LINES_AFTER]);
+        const lines = before.rows.reverse().concat(after.rows).map(x => ({ id: x.id, senderId: x.sender_commander_id || 0, senderName: x.sender_name, text: x.text, createdAt: x.created_at, reported: x.id === rowId }));
+        await pool.query('INSERT INTO report_context_log (report_id, admin_commander_id, alliance_id, row_id, lines) VALUES ($1, $2, $3, $4, $5)', [id, caller.commanderId, allianceId, rowId, lines.length]);
+        res.json({ success: true, lines });
+    } catch (e) { console.error('[Kontext] Fehler:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+
+// ---- Erledigtes sofort loeschen (Support-Eingang); Fristen: siehe retentionMaintain (§51) ----
+app.post('/support/inbox/purge-done', async (req, res) => {
+    const caller = await requireCaller(req, res); if (!caller) return;
+    if (!ADMIN_COMMANDER_IDS.includes(Number(caller.commanderId))) return res.status(403).json({ success: false, error: 'Nur Admin-Konten.' });
+    try {
+        const a = await pool.query("DELETE FROM support_messages WHERE status <> 'new'");
+        const b = await pool.query("DELETE FROM player_reports WHERE status <> 'new'");
+        res.json({ success: true, forms: a.rowCount, reports: b.rowCount });
+    } catch (e) { console.error('[Eingang] Aufraeumen:', e.message); res.status(500).json({ success: false, error: 'Interner Serverfehler.' }); }
+});
+// SCHUTZ52-ENDE
 
 // #####################################################################
 // §11  ICC-WIRTSCHAFT (Virgo-Shop, Geschenkkiste, Promocodes)
@@ -5303,7 +5486,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -7794,6 +7977,8 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             const blockRows = await client.query('DELETE FROM player_blocks WHERE blocker_commander_id = $1 OR blocked_commander_id = $1', [commanderId]);
             summary.blocksDeleted = blockRows.rowCount;
             await client.query('DELETE FROM account_language WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§51)
+            await client.query('DELETE FROM chat_mutes WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§52)
+            await client.query('DELETE FROM alliance_chat_mutes WHERE commander_id = $1', [commanderId]);
         }
 
         const highscore = await client.query(
