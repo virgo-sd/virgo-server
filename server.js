@@ -1226,6 +1226,11 @@ async function initDatabase() {
         await pool.query(`ALTER TABLE alliance_chat ADD COLUMN IF NOT EXISTS ref TEXT;`);
         // NEU 07.11.2026 (§57): Heimatplanet je Commander (Wechsel fruehestens alle 48 h, Schutz vor Invasion/Sprengung ist fuer spaeter vorgesehen)
         await pool.query(`CREATE TABLE IF NOT EXISTS commander_home (commander_id INTEGER PRIMARY KEY, coord TEXT NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        // NEU 08.11.2026 (§58): Geschenk-Anteil je Commander und Ware (Menge, die aus Server-Geschenken stammt und nicht gehandelt/verschickt werden darf) + Piraten-Kisten (Beute der Rueckflug-Flotte)
+        await pool.query(`CREATE TABLE IF NOT EXISTS gift_share (commander_id INTEGER NOT NULL, kind TEXT NOT NULL, idx INTEGER NOT NULL, amount BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (commander_id, kind, idx));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS pirate_crate_loot (id SERIAL PRIMARY KEY, commander_id INTEGER NOT NULL, fleet_id TEXT NOT NULL, coord TEXT NOT NULL, item_id TEXT NOT NULL, granted BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_pirate_crate_fleet ON pirate_crate_loot (fleet_id);`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_pirate_crate_commander ON pirate_crate_loot (commander_id, created_at DESC);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS account_language (commander_id INTEGER PRIMARY KEY, lang TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         // NEU 07.11.2026 (§53/§54): Privatnachrichten, Lesemarken, AGI-Aitan-Nachrichten
         await pool.query(`CREATE TABLE IF NOT EXISTS dm_messages (id BIGSERIAL PRIMARY KEY, sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'msg', unverified BOOLEAN NOT NULL DEFAULT false, created_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
@@ -5801,7 +5806,8 @@ app.post('/shop/purchase', async (req, res) => {
     const { playFabId, itemId, targetCoord } = req.body;
     if (!playFabId || !itemId || !targetCoord || typeof itemId !== 'string' || typeof targetCoord !== 'string')
         return res.status(400).json({ success: false, error: 'Fehlende Parameter' });
-    if (!(await requireCaller(req, res, { playFabId }))) return; // NEU 07.10.2026: nur fuer das eigene Konto kaufen
+    const shopCaller = await requireCaller(req, res, { playFabId }); // NEU 07.10.2026: nur fuer das eigene Konto kaufen
+    if (!shopCaller) return;
 
     let quantity = req.body.quantity === undefined ? 1 : parseInt(req.body.quantity, 10);
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > SHOP_MAX_QUANTITY)
@@ -5877,6 +5883,12 @@ app.post('/shop/purchase', async (req, res) => {
         });
 
         await iccTrustSet(playFabId, commander.accountResources[4]);
+
+        // NEU 08.11.2026 (§58): Pakete mit Rohstoffen/Schiffen sind Geschenke des Servers -> Geschenk-Anteil
+        if (item.reward_kind === 'resource' || item.reward_kind === 'warship' || item.reward_kind === 'ship') {
+            try { await giftShareAdd(shopCaller.commanderId, item.reward_kind, item.reward_index, totalReward); }
+            catch (giftError) { console.error('[Geschenk-Anteil] Shop: Eintrag fehlgeschlagen (Commander ' + shopCaller.commanderId + '):', giftError.message); }
+        }
 
         res.json({ success: true, newIccBalance: commander.accountResources[4] });
     } catch (error) {
@@ -6228,7 +6240,7 @@ const DB_EXPORT_TABLES = ['alliances', 'alliance_ranks', 'alliance_members', 'al
     'support_messages', 'support_chats', 'support_chat_messages', 'player_reports', 'player_blocks', 'shop_items', 'promo_codes', 'promo_redemptions', 'giftbox_claims', 'giftbox_golden_claims',
     'market_offers', 'transport_deliveries', 'planet_registry', 'combat_reports', 'attack_traces', 'processed_fleets',
     'galaxy_sectors', 'galaxy_config', 'galaxy_texts', 'stationed_fleets', 'achievement_state', 'achievement_locks', 'achievement_log', 'alliance_treasury', 'alliance_treasury_log',
-    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'commander_home', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages', 'public_chat'];
+    'npc_clans', 'npc_bases', 'npc_raids', 'npc_events', 'daily_quest_state', 'daily_events', 'combat_points_log', 'account_language', 'commander_home', 'gift_share', 'pirate_crate_loot', 'chat_mutes', 'alliance_chat_settings', 'alliance_chat_mutes', 'report_context_log', 'dm_messages', 'dm_reads', 'agi_messages', 'public_chat'];
 app.get('/admin/db-export', async (req, res) => {
     if (process.env.DB_EXPORT_ENABLED !== 'true') return res.status(404).json({ success: false, error: 'Nicht verfuegbar.' });
     if (!adminKeyOk(adminKeyFrom(req))) return res.status(403).json({ success: false, error: 'Nicht autorisiert' });
@@ -8265,6 +8277,20 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         }
     }
 
+    // NEU 08.11.2026 (§58): Piraten-Beute - bei Sieg und genug zerstoerten Schiffen faellt eine handelbare Kleine Kiste; sie reist mit der Rueckflug-Flotte
+    if (npcCtx && attackerWins) {
+        try {
+            let pirateKills = 0;
+            for (let i = 0; i < 10; i++) pirateKills += Math.max(0, (npcCtx.before[i] || 0) - (defenderAfterWarships[i] || 0));
+            const crateItem = await pirateCrateDecide(attackerCommander.commanderId, destCoord, pirateKills);
+            if (crateItem) {
+                await pirateCrateRecord(attackerCommander.commanderId, attackerFleet.fleetId + '-R', destCoord, crateItem);
+                report.lootCrate = crateItem;
+                log.push(`Piraten-Kiste ${crateItem} fuer ${attackerCommander.commanderId} (Rueckflug ${attackerFleet.fleetId}-R)`);
+            }
+        } catch (e) { console.error('[Piraten-Kiste] Entscheidung fehlgeschlagen:', e.message); }
+    }
+
     // Verteidiger-Planet + Commander speichern (falls bekannt)
     if (defenderPfid && defenderPlanetKey && defenderPlanet) {
         defenderPlanet.warships = defenderAfterWarships;
@@ -8438,8 +8464,15 @@ async function processReturn(playFabId, commander, fleet, log) {
         Permission: 'Private'
     });
 
+    // NEU 08.11.2026 (§58): Piraten-Kiste kommt mit der Flotte an
+    let crateLine = '';
+    try {
+        const crate = await pirateCrateClaim(playFabId, fleet.fleetId);
+        if (crate) crateLine = ` Beute: 1x ${inventoryItemLabel(crate)} liegt in deinem Inventar.`;   // LOCALIZE
+    } catch (e) { console.error('[Piraten-Kiste] Rueckflug:', e.message); }
+
     await sendMail(commander, 'Flotte zurückgekehrt',
-        `Flotte ${fleet.fleetId} ist auf ${fleet.destinationCoord} gelandet.`, 1);
+        `Flotte ${fleet.fleetId} ist auf ${fleet.destinationCoord} gelandet.${crateLine}`, 1);
 
     log.push(`Rückflug gelandet: ${fleet.fleetId}`);
 
@@ -8715,6 +8748,8 @@ async function deleteAccountDataFor(playFabId, commanderId) {
             summary.blocksDeleted = blockRows.rowCount;
             await client.query('DELETE FROM account_language WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§51)
             await client.query('DELETE FROM commander_home WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§57)
+            await client.query('DELETE FROM gift_share WHERE commander_id = $1', [commanderId]);   // NEU 08.11.2026 (§58)
+            await client.query('DELETE FROM pirate_crate_loot WHERE commander_id = $1', [commanderId]);   // NEU 08.11.2026 (§58)
             await client.query('DELETE FROM chat_mutes WHERE commander_id = $1', [commanderId]);   // NEU 07.11.2026 (§52)
             const dmRows = await client.query('DELETE FROM dm_messages WHERE sender_id = $1 OR recipient_id = $1', [commanderId]);   // NEU 07.11.2026 (§53): Privatnachrichten (gesendet und empfangen)
             summary.privateMessagesDeleted = dmRows.rowCount;
@@ -8940,6 +8975,10 @@ async function buildPlayerInspectionReport(rawQuery) {
     if (/^\s*#inv\b/i.test(String(rawQuery || '')))
         return await buildInventoryAdminReport(String(rawQuery).trim());
 
+    // NEU 08.11.2026: Geschenk-Anteil-Werkzeug (§58) — Befehle mit "#gift" am Anfang
+    if (/^\s*#gift\b/i.test(String(rawQuery || '')))
+        return await buildGiftAdminReport(String(rawQuery).trim());
+
     // NEU 21.10.2026: Piraten-Werkzeug (§36) — Befehle mit "#npc" am Anfang
     if (/^\s*#npc\b/i.test(String(rawQuery || '')))
         return await buildNpcAdminReport(String(rawQuery).trim());
@@ -8957,7 +8996,7 @@ async function buildPlayerInspectionReport(rawQuery) {
         return await buildRegistryAdminReport(String(rawQuery).trim());
 
     const parsed = parseInspectQuery(rawQuery);
-    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2\nGalaxie-Register: #register (Status), #register rebuild, #register 1:1:1:1\nInventar: #inv (Hilfe), #inv 1000005, #inv give 1000005 crate_res_0 5';
+    if (!parsed) return 'Bitte etwas eingeben: Commander-ID (z.B. 1000005), Ingame-Name (z.B. Agnes) oder PlayFab-ID (z.B. 1405316AFCC3DEDE).\nOptional danach Koordinaten, z.B.: 1000005 1:1:1:1 1:1:1:2\nGalaxie-Register: #register (Status), #register rebuild, #register 1:1:1:1\nInventar: #inv (Hilfe), #inv 1000005, #inv give 1000005 crate_res_0 5\nGeschenk-Anteil: #gift (Hilfe), #gift 1000005, #gift reset 1000005';
 
     const out = [];
     const add = (line = '') => out.push(line);
@@ -10586,6 +10625,7 @@ app.get('/market/mine', async (req, res) => {
             })),
             pending: { count: pending.rows[0].n, soldCount: pending.rows[0].sold, returnCount: pending.rows[0].returns, deliveryDue: onTheWay.rows.filter(r => r.seconds_left <= 0).length },
             deliveries: onTheWay.rows.map(r => ({ id: r.id, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, coord: r.buyer_coord, secondsLeft: r.seconds_left })),
+            giftShare: await giftShareList(who.commanderId),
             delivery: { baseHours: MARKET_DELIVERY_BASE_HOURS, perSectorHours: MARKET_DELIVERY_PER_SECTOR_HOURS, galaxySectors: MARKET_DELIVERY_GALAXY_SECTORS, kinds: MARKET_DELIVERY_KINDS }
         });
     } catch (error) {
@@ -10646,6 +10686,11 @@ app.post('/market/create', async (req, res) => {
             } else {
             if (marketHave(planet, kind, index) < amount)
                 return { status: 400, body: { success: false, error: 'Nicht genug Vorrat auf diesem Planeten.' } };
+
+            // NEU 08.11.2026 (§58): Geschenke des Servers (Kisten, Shop-Pakete, Startrohstoffe) duerfen nicht gehandelt werden - nur der Rest
+            const sellable = await giftSellableAmount(who.playFabId, commander, who.commanderId, kind, index);
+            if (amount > sellable)
+                return { status: 400, body: { success: false, sellable, error: `Davon sind nur ${marketNum(sellable)} handelbar - der Rest stammt aus Geschenken des Servers (Kisten, Shop-Pakete, Startrohstoffe) und kann nicht gehandelt werden.` } };
 
             marketRemove(planet, kind, index, amount);
             await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
@@ -11003,6 +11048,154 @@ app.post('/market/claim', async (req, res) => {
 });
 
 // #####################################################################
+// §58  GESCHENK-ANTEIL und PIRATEN-KISTEN (08.11.2026, Nutzerentscheidung "Loesung 1")
+//      ZIEL: Server-Geschenke duerfen nicht von einem Konto zum naechsten wandern (Mehrfachkonten). Gehandelt/verschickt werden darf nur, was ein Konto
+//      selbst produziert, gebaut oder erspielt (Piraten-Beute) hat.
+//      Beim Oeffnen einer NICHT handelbaren Kiste (Shop, Erfolge, Geschenkkiste ...), bei Shop-Paketen mit Rohstoffen/Schiffen und bei den Startrohstoffen einer neuen
+//      Kolonie merkt sich der Server die Menge als GESCHENK-ANTEIL je Rohstoff/Schiffsart (Tabelle gift_share). HANDELBAR ist je Art nur max(0, Gesamtbestand
+//      aller Kolonien + eigener Flotten unterwegs - Geschenk-Anteil). Der Anteil sinkt nie von selbst (Admin: #gift reset); wer Geschenke verbraucht hat, kann erst
+//      wieder handeln, wenn sein Bestand ueber dem Anteil liegt. Ausnahmen (bleiben handelbar): Alpha-Schiffe (herbeigezaubert), Admin-Vergaben, Altbestand.
+//      Geprueft wird beim Anbieten im Spielerhandel (/market/create) und beim Transport an fremde Commander (/transport/deliver).
+//      PIRATEN-KISTEN: Gewinnt ein Spieler gegen einen Piratenstuetzpunkt und vernichtet mindestens PIRATE_CRATE_MIN_KILLS Schiffe, faellt EINE zufaellige
+//      handelbare Kleine Kiste (Ress01-05, Endung _t) an. Sie reist mit der Rueckflug-Flotte (Tabelle pirate_crate_loot, Schluessel = Flotten-ID mit "-R") und landet
+//      bei deren Ankunft im Inventar. Grenzen gegen Farmen: je Commander hoechstens PIRATE_CRATE_DAILY_MAX in 24 h und je Stuetzpunkt 1 in 24 h.
+// #####################################################################
+// GIFT58-START
+const GIFT_LEN = { resource: 5, warship: 10, ship: 6 };
+function giftTracked(kind, idx) { return !!GIFT_LEN[kind] && Number.isInteger(idx) && idx >= 0 && idx < GIFT_LEN[kind]; }
+
+// delta > 0: Anteil erhoehen; delta < 0: verringern (nicht unter 0, z. B. Rueckbuchung)
+async function giftShareAdd(commanderId, kind, idx, delta) {
+    delta = Math.floor(Number(delta));
+    if (!giftTracked(kind, idx) || !Number.isFinite(delta) || delta === 0 || !(Number(commanderId) >= 1000000)) return;
+    if (delta > 0)
+        await pool.query('INSERT INTO gift_share (commander_id, kind, idx, amount) VALUES ($1, $2, $3, $4) ON CONFLICT (commander_id, kind, idx) DO UPDATE SET amount = gift_share.amount + EXCLUDED.amount', [Number(commanderId), kind, idx, delta]);
+    else
+        await pool.query('UPDATE gift_share SET amount = GREATEST(0, amount + $4) WHERE commander_id = $1 AND kind = $2 AND idx = $3', [Number(commanderId), kind, idx, delta]);
+}
+
+async function giftShareAddByPlayFab(playFabId, kind, idx, delta) {
+    if (typeof authCommanderIdFor !== 'function') return;
+    const id = await authCommanderIdFor(playFabId);
+    if (id !== null && id !== undefined) await giftShareAdd(Number(id), kind, idx, delta);
+}
+
+async function giftShareMap(commanderId) {
+    const r = await pool.query('SELECT kind, idx, amount FROM gift_share WHERE commander_id = $1', [Number(commanderId)]);
+    const m = { resource: new Array(5).fill(0), warship: new Array(10).fill(0), ship: new Array(6).fill(0) };
+    for (const row of r.rows) if (giftTracked(row.kind, Number(row.idx))) m[row.kind][Number(row.idx)] = Number(row.amount) || 0;
+    return m;
+}
+
+// Gesamtbestand: alle Kolonien + Ladung/Schiffe eigener Flotten, die noch unterwegs sind (stationierte Gaeste zaehlen NICHT mit - das ist zu Gunsten der Sperre)
+async function giftStockTotals(playFabId, commander) {
+    const t = { resource: new Array(5).fill(0), warship: new Array(10).fill(0), ship: new Array(6).fill(0) };
+    const addArr = (kind, arr) => { if (Array.isArray(arr)) arr.forEach((n, i) => { if (i < t[kind].length) t[kind][i] += Math.max(0, Number(n) || 0); }); };
+    const coords = Array.isArray(commander.colonies) ? commander.colonies : [];
+    for (let i = 0; i < coords.length; i += 9) {
+        const planets = await marketLoadPlanets(playFabId, coords.slice(i, i + 9));
+        for (const c of Object.keys(planets)) { const p = planets[c]; addArr('resource', (p.ressources || []).slice(0, 5)); addArr('warship', p.warships); addArr('ship', p.ships); }
+    }
+    for (const f of (Array.isArray(commander.activeFleets) ? commander.activeFleets : [])) {
+        if (!f || f.hasArrived) continue;
+        addArr('resource', (f.ressources || []).slice(0, 5)); addArr('warship', f.warships); addArr('ship', f.ships);
+    }
+    return t;
+}
+
+// handelbar = max(0, Bestand - Geschenk-Anteil), je Art
+async function giftSellable(playFabId, commander, commanderId) {
+    const totals = await giftStockTotals(playFabId, commander), share = await giftShareMap(commanderId);
+    const out = { resource: [], warship: [], ship: [] };
+    for (const k of Object.keys(out)) out[k] = totals[k].map((n, i) => Math.max(0, n - share[k][i]));
+    return { sellable: out, totals, share };
+}
+
+// Wie viel einer Art darf der Commander anbieten? (Nur Ressourcen Ress01-05, Kampfschiffe, Zivilschiffe; Kisten sind ueber die _t-Kennung geregelt.)
+async function giftSellableAmount(playFabId, commander, commanderId, kind, idx) {
+    if (!giftTracked(kind, idx)) return Infinity;
+    const r = await giftSellable(playFabId, commander, commanderId);
+    return r.sellable[kind][idx];
+}
+
+// Transport an einen FREMDEN Commander: erlaubte Menge je Ressource. Noch unterwegs befindliche andere Transporte (nicht Rueckflug) zaehlen schon als vergeben.
+async function giftTransportLimits(playFabId, commander, commanderId, thisFleetId) {
+    const r = await giftSellable(playFabId, commander, commanderId);
+    const pending = [0, 0, 0, 0, 0];
+    for (const f of (Array.isArray(commander.activeFleets) ? commander.activeFleets : [])) {
+        if (!f || f.hasArrived || f.fleetId === thisFleetId || f.isReturnFlight || Number(f.mission) !== 1) continue;
+        (f.ressources || []).slice(0, 5).forEach((n, i) => { pending[i] += Math.max(0, Number(n) || 0); });
+    }
+    return r.sellable.resource.map((n, i) => Math.max(0, n - pending[i]));
+}
+
+// ---- Piraten-Kisten ----
+const PIRATE_CRATE_MIN_KILLS = 10, PIRATE_CRATE_DAILY_MAX = 2;
+
+// Wuerfelt, ob (und welche) Kiste faellt. rng nur fuer Tests. Gibt den Inventar-Schluessel der HANDELBAREN Kleinen Kiste oder null.
+async function pirateCrateDecide(commanderId, coord, kills, rng) {
+    if (!(Number(kills) >= PIRATE_CRATE_MIN_KILLS)) return null;
+    const day = await pool.query("SELECT COUNT(*)::int AS n FROM pirate_crate_loot WHERE commander_id = $1 AND created_at > now() - interval '24 hours'", [Number(commanderId)]);
+    if (day.rows[0].n >= PIRATE_CRATE_DAILY_MAX) return null;
+    const base = await pool.query("SELECT COUNT(*)::int AS n FROM pirate_crate_loot WHERE commander_id = $1 AND coord = $2 AND created_at > now() - interval '24 hours'", [Number(commanderId), String(coord)]);
+    if (base.rows[0].n >= 1) return null;
+    const r = typeof rng === 'function' ? rng() : Math.random();
+    return 'crate_res_' + Math.min(4, Math.floor(r * 5)) + '_t';
+}
+
+async function pirateCrateRecord(commanderId, returnFleetId, coord, itemId) {
+    await pool.query('INSERT INTO pirate_crate_loot (commander_id, fleet_id, coord, item_id) VALUES ($1, $2, $3, $4)', [Number(commanderId), String(returnFleetId), String(coord), itemId]);
+}
+
+// Beim Landen der Rueckflug-Flotte: die Kiste ins Inventar legen (genau einmal). Gibt den Schluessel zurueck oder null.
+async function pirateCrateClaim(playFabId, returnFleetId) {
+    const r = await pool.query('UPDATE pirate_crate_loot SET granted = true WHERE fleet_id = $1 AND granted = false RETURNING id, item_id', [String(returnFleetId)]);
+    if (r.rows.length === 0) return null;
+    const row = r.rows[0];
+    try {
+        await inventoryGrant(playFabId, row.item_id, 1);
+        return row.item_id;
+    } catch (e) {
+        console.error('[Piraten-Kiste] Gutschrift fehlgeschlagen (Flotte ' + returnFleetId + '), bleibt offen:', e.message);
+        try { await pool.query('UPDATE pirate_crate_loot SET granted = false WHERE id = $1', [row.id]); } catch (e2) { console.error('[Piraten-Kiste] FREIGABE FEHLGESCHLAGEN:', e2.message); }
+        return null;
+    }
+}
+// Admin-Werkzeug (Spieler-Info-Feld): #gift | #gift <ID> | #gift reset <ID> [Art Index] | #gift add <ID> <Art> <Index> <Menge>    (Art: resource | warship | ship)
+async function buildGiftAdminReport(raw) {
+    const t = raw.split(/\s+/).slice(1);
+    const help = 'Geschenk-Anteil (Menge je Ware, die aus Server-Geschenken stammt und nicht gehandelt/verschickt werden darf):\n  #gift <Commander-ID>                       Anteil anzeigen\n  #gift reset <Commander-ID>                 alles auf 0 (z. B. Test-Konto)\n  #gift reset <Commander-ID> <Art> <Index>   eine Ware auf 0 (Art: resource | warship | ship, Index ab 0)\n  #gift add <Commander-ID> <Art> <Index> <Menge>   Anteil erhoehen (negativ = senken)';
+    if (t.length === 0) return help;
+    const names = { resource: i => marketItemName('resource', i), warship: i => marketItemName('warship', i), ship: i => marketItemName('ship', i) };
+    const show = async id => {
+        const list = await giftShareList(id);
+        return list.length === 0 ? `Commander ${id}: kein Geschenk-Anteil - alles handelbar.` : `Commander ${id}: Geschenk-Anteil\n` + list.map(g => `  ${g.kind} ${g.index} (${(names[g.kind] ? names[g.kind](g.index) : '')}): ${marketNum(g.amount)}`).join('\n');
+    };
+    if (/^\d{7,8}$/.test(t[0])) return await show(parseInt(t[0], 10));
+    const cmd = t[0].toLowerCase(), id = parseInt(t[1], 10);
+    if (!(id >= 1000000)) return help;
+    if (cmd === 'reset') {
+        if (t.length >= 4) { const idx = parseInt(t[3], 10); if (!giftTracked(t[2], idx)) return 'Unbekannte Ware. ' + help; await pool.query('DELETE FROM gift_share WHERE commander_id = $1 AND kind = $2 AND idx = $3', [id, t[2], idx]); }
+        else await pool.query('DELETE FROM gift_share WHERE commander_id = $1', [id]);
+        return 'Zurueckgesetzt.\n' + await show(id);
+    }
+    if (cmd === 'add' && t.length >= 5) {
+        const idx = parseInt(t[3], 10), amount = parseInt(t[4], 10);
+        if (!giftTracked(t[2], idx) || !Number.isInteger(amount)) return 'Ungueltige Angabe. ' + help;
+        await giftShareAdd(id, t[2], idx, amount);
+        return 'Eingetragen.\n' + await show(id);
+    }
+    return help;
+}
+
+async function giftShareList(commanderId) {
+    const m = await giftShareMap(commanderId), out = [];
+    for (const k of Object.keys(m)) m[k].forEach((n, i) => { if (n > 0) out.push({ kind: k, index: i, amount: n }); });
+    return out;
+}
+// GIFT58-ENDE
+
+// #####################################################################
 // §28  INVENTAR (Gegenstaende der Spieler) — NEU 04.10.2026
 //      Jeder Commander hat ein eigenes Inventar. Es liegt SERVERSEITIG in den PlayFab-"Internal Data" des Spielers
 //      (Key "inventory", JSON {"items":{"<itemId>":<Anzahl>}}): Spieler/Client koennen dort weder lesen noch schreiben,
@@ -11307,6 +11500,10 @@ app.post('/inventory/use', async (req, res) => {
                 entries.commander_data = commander;
             }
 
+            // NEU 08.11.2026 (§58): Inhalt einer NICHT handelbaren Kiste ist ein Geschenk -> Geschenk-Anteil merken (vor dem Gutschreiben; bei Fehler wird zurueckgenommen)
+            const giftTrack = !def.tradable && needsPlanet && giftTracked(def.kind, def.index);
+            if (giftTrack) await giftShareAdd(who.commanderId, def.kind, def.index, total);
+
             // 1) Kiste(n) aus dem Inventar entfernen ...
             const remaining = have - quantity;
             if (remaining > 0) inv.items[itemId] = remaining; else delete inv.items[itemId];
@@ -11317,6 +11514,7 @@ app.post('/inventory/use', async (req, res) => {
                 await marketSaveEntries(who.playFabId, entries);
             } catch (saveError) {
                 console.error('[Inventar] use: Gutschrift fehlgeschlagen, buche Kiste zurueck:', saveError.message);
+                try { if (giftTrack) await giftShareAdd(who.commanderId, def.kind, def.index, -total); } catch (e3) { console.error('[Geschenk-Anteil] Rueckbuchung fehlgeschlagen:', e3.message); }
                 try {
                     inv.items[itemId] = have;
                     await inventorySave(who.playFabId, inv);
@@ -11439,8 +11637,18 @@ app.post('/transport/deliver', async (req, res) => {
 
     try {
         // Schon geliefert? (Wiederholter Aufruf nach Netzfehler) -> gleiche Antwort wie beim ersten Mal
-        const already = await pool.query('SELECT 1 FROM transport_deliveries WHERE fleet_id = $1 AND sender_commander_id = $2', [fleetId, who.commanderId]);
-        if (already.rows.length > 0) return res.json({ success: true, delivered: true, duplicate: true });
+        const already = await pool.query('SELECT res0, res1, res2, res3, res4 FROM transport_deliveries WHERE fleet_id = $1 AND sender_commander_id = $2', [fleetId, who.commanderId]);
+        if (already.rows.length > 0) {
+            // NEU 08.11.2026 (§58): wurde nur ein Teil zugestellt, bekommt der Client bei jeder Wiederholung dieselbe Rueckgabe-Menge
+            let returned = [0, 0, 0, 0, 0];
+            try {
+                const d0 = await playfabServer('/Server/GetUserData', { PlayFabId: who.playFabId, Keys: ['commander_data'] });
+                const c0 = d0 && d0.Data && d0.Data['commander_data'] ? JSON.parse(d0.Data['commander_data'].Value) : null;
+                const f0 = c0 && Array.isArray(c0.activeFleets) ? c0.activeFleets.find(x => x && x.fleetId === fleetId) : null;
+                if (f0 && Array.isArray(f0.ressources)) returned = [0, 1, 2, 3, 4].map(i => Math.max(0, Math.floor(Number(f0.ressources[i]) || 0) - Number(already.rows[0]['res' + i] || 0)));
+            } catch (e0) { /* ohne Rueckgabe-Menge antworten */ }
+            return res.json({ success: true, delivered: true, duplicate: true, returned });
+        }
 
         const data = await playfabServer('/Server/GetUserData', { PlayFabId: who.playFabId, Keys: ['commander_data'] });
         const entry = data && data.Data && data.Data['commander_data'];
@@ -11468,6 +11676,14 @@ app.post('/transport/deliver', async (req, res) => {
         const recipientId = Number(row.owner_commander_id);
         if (recipientId === who.commanderId) return res.json({ success: true, delivered: false, reason: 'own_planet' });
 
+        // NEU 08.11.2026 (§58): Geschenk-Anteil - Rohstoffe aus Server-Geschenken duerfen nicht an andere Commander verschickt werden; der Rest kehrt mit der Flotte zurueck
+        const sentOriginal = cargo.slice();
+        const limits = await giftTransportLimits(who.playFabId, commander, who.commanderId, fleetId);
+        for (let i = 0; i < 5; i++) if (cargo[i] > limits[i]) cargo[i] = limits[i];
+        const returnedCargo = sentOriginal.map((n, i) => n - cargo[i]);
+        if (returnedCargo.some(n => n > 0)) console.log(`[Transport] ${fleetId}: Geschenk-Anteil haelt ${returnedCargo.join('/')} zurueck`);
+        if (cargo.every(n => n === 0)) return res.json({ success: true, delivered: false, reason: 'gift_share', returned: returnedCargo });
+
         const senderName = String(commander.visibleName || ('Commander ' + who.commanderId)).slice(0, 32);
         const ins = await pool.query(
             `INSERT INTO transport_deliveries (fleet_id, sender_commander_id, sender_name, recipient_commander_id, target_coord, res0, res1, res2, res3, res4)
@@ -11475,7 +11691,7 @@ app.post('/transport/deliver', async (req, res) => {
              ON CONFLICT (fleet_id) DO NOTHING RETURNING id`,
             [fleetId, who.commanderId, senderName, recipientId, coord, cargo[0], cargo[1], cargo[2], cargo[3], cargo[4]]);
         console.log(`[Transport] ${fleetId}: Commander ${who.commanderId} liefert ${cargo.join('/')} an Commander ${recipientId} (${coord})${ins.rowCount === 0 ? ' [doppelt]' : ''}`);
-        res.json({ success: true, delivered: true, duplicate: ins.rowCount === 0 });
+        res.json({ success: true, delivered: true, duplicate: ins.rowCount === 0, returned: returnedCargo });
     } catch (error) {
         console.error('[Transport] deliver Fehler:', error.message);
         marketFail(res, 500, 'Lieferung konnte nicht gemeldet werden.');
@@ -11988,6 +12204,10 @@ async function terraformCompleteForPlanet(playFabId, coord, planet, now) {
         fresh.lastProductionTickUtc = until.toISOString();      // Produktion zaehlt ab dem Abschluss
 
         await playfabServer('/Server/UpdateUserData', { PlayFabId: playFabId, Data: { [key]: JSON.stringify(fresh) }, Permission: 'Private' });
+        if (grant && typeof giftShareAddByPlayFab === 'function') {   // NEU 08.11.2026 (§58): Startrohstoffe einer neuen Kolonie sind ein Geschenk
+            try { for (let i = 0; i < 4; i++) await giftShareAddByPlayFab(playFabId, 'resource', i, COLONY_START_RESOURCES); }
+            catch (giftError) { console.error('[Geschenk-Anteil] Kolonie-Start: Eintrag fehlgeschlagen:', giftError.message); }
+        }
         if (planet) Object.assign(planet, fresh);
         return { completed: grant };
     });
