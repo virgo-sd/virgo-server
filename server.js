@@ -10194,8 +10194,19 @@ const MARKET_SHIP_NAMES = {
 const MARKET_KINDS = {
     resource: { indices: [0, 1, 2, 3, 4], minAmount: 1000, maxAmount: 1000000000, field: 'ressources', length: 5 },
     warship:  { indices: [0, 1, 2, 3],    minAmount: 1,   maxAmount: 1000000,    field: 'warships',   length: 10 },
-    ship:     { indices: [1, 3],          minAmount: 1,   maxAmount: 1000000,    field: 'ships',      length: 6 }
+    ship:     { indices: [1, 3],          minAmount: 1,   maxAmount: 1000000,    field: 'ships',      length: 6 },
+    // NEU 08.11.2026: handelbare KISTEN (liegen im Inventar, nicht auf dem Planeten). crate_res: Kleine Kiste Ress01-05 (Index 0-4);
+    // crate_ship: Schiffskiste, Index 0-3 = Warship01-04, 11 = Container (Ship01), 13 = Kolonisationsschiff (Ship03). Gehandelt wird nur die handelbare Variante (_t).
+    crate_res:  { indices: [0, 1, 2, 3, 4],        minAmount: 1, maxAmount: 1000000, inventory: true },
+    crate_ship: { indices: [0, 1, 2, 3, 11, 13],   minAmount: 1, maxAmount: 1000000, inventory: true }
 };
+
+function marketIsCrate(kind) { return !!(MARKET_KINDS[kind] && MARKET_KINDS[kind].inventory); }
+// Inventar-Schluessel der handelbaren Kiste zu einem Marktartikel
+function marketCrateItemId(kind, index) {
+    if (kind === 'crate_res') return 'crate_res_' + index + '_t';
+    return index < 10 ? 'crate_warship_' + index + '_t' : 'crate_ship_' + (index - 10) + '_t';
+}
 
 function marketItemValid(kind, index) {
     const def = MARKET_KINDS[kind];
@@ -10205,6 +10216,8 @@ function marketItemValid(kind, index) {
 // Wert EINER Einheit in Wertpunkten (Ressource: ihr Gewicht, Schiff: Summe Baukosten x Gewicht).
 function marketValuePerUnit(kind, index) {
     if (kind === 'resource') return MARKET_VALUE_WEIGHT[index] || 0;
+    if (kind === 'crate_res') return (INVENTORY_CRATE_AMOUNTS[index] || 0) * (MARKET_VALUE_WEIGHT[index] || 0);   // Inhalt der Kiste x Wertgewicht
+    if (kind === 'crate_ship') return marketValuePerUnit(index < 10 ? 'warship' : 'ship', index < 10 ? index : index - 10);
     const costs = MARKET_SHIP_COSTS[kind] && MARKET_SHIP_COSTS[kind][index];
     if (!costs) return 0;
     let total = 0;
@@ -10214,6 +10227,8 @@ function marketValuePerUnit(kind, index) {
 
 function marketItemName(kind, index) {
     if (kind === 'resource') return MARKET_RESOURCE_NAMES[index] || ('Ress' + (index + 1));
+    if (kind === 'crate_res') return 'Kleine Kiste: ' + (MARKET_RESOURCE_NAMES[index] || ('Ress' + (index + 1)));
+    if (kind === 'crate_ship') return 'Schiffskiste: ' + marketItemName(index < 10 ? 'warship' : 'ship', index < 10 ? index : index - 10);
     return (MARKET_SHIP_NAMES[kind] && MARKET_SHIP_NAMES[kind][index]) || (kind + index);
 }
 
@@ -10236,7 +10251,7 @@ function marketPriceBounds(kind, index, amount, priceResource) {
 const MARKET_DELIVERY_BASE_HOURS       = 3;
 const MARKET_DELIVERY_PER_SECTOR_HOURS = 2;
 const MARKET_DELIVERY_GALAXY_SECTORS   = 5;
-const MARKET_DELIVERY_KINDS            = ['resource', 'warship', 'ship'];
+const MARKET_DELIVERY_KINDS            = ['resource', 'warship', 'ship', 'crate_res', 'crate_ship'];
 
 function marketCoordParts(coord) {
     const m = /^(\d+):(\d+):(\d+):(\d+)$/.exec(String(coord || ''));
@@ -10279,6 +10294,7 @@ function marketPlanetKey(coord) { return 'planet_' + String(coord).replace(/:/g,
 function marketNormalizePlanet(planet) {
     for (const kind of Object.keys(MARKET_KINDS)) {
         const def = MARKET_KINDS[kind];
+        if (!def.field) continue;   // Kisten liegen im Inventar, nicht auf dem Planeten
         if (!Array.isArray(planet[def.field])) planet[def.field] = [];
         while (planet[def.field].length < def.length) planet[def.field].push(0);
     }
@@ -10343,6 +10359,20 @@ function marketAdd(planet, kind, index, amount) {
 function marketRemove(planet, kind, index, amount) {
     const field = MARKET_KINDS[kind].field;
     planet[field][index] = (Number(planet[field][index]) || 0) - amount;
+}
+
+// NEU 08.11.2026: Kisten im Inventar bewegen (Aufrufer haelt den Spieler-Lock). Gibt false zurueck, wenn nicht genug da sind (nur beim Abziehen).
+async function marketInventoryAdd(playFabId, kind, index, amount) {
+    const inv = await inventoryLoad(playFabId), id = marketCrateItemId(kind, index);
+    inv.items[id] = Math.min(INVENTORY_MAX_STACK, (Number(inv.items[id]) || 0) + amount);
+    await inventorySave(playFabId, inv);
+}
+async function marketInventoryRemove(playFabId, kind, index, amount) {
+    const inv = await inventoryLoad(playFabId), id = marketCrateItemId(kind, index), have = Number(inv.items[id]) || 0;
+    if (have < amount) return false;
+    if (have - amount > 0) inv.items[id] = have - amount; else delete inv.items[id];
+    await inventorySave(playFabId, inv);
+    return true;
 }
 
 function marketStrictInt(value) {
@@ -10460,7 +10490,12 @@ app.get('/market/offers', async (req, res) => {
             if (Number.isInteger(index) && index >= 0) { params.push(index); where += ` AND resource_index = $${params.length}`; }
         } else if (kindParam === 'ship') {
             where += ` AND item_kind IN ('warship', 'ship')`;
+        } else if (kindParam === 'crate_res' || kindParam === 'crate_ship') {   // NEU 08.11.2026: Kisten-Gruppen im Reiter Kaufen
+            where += ` AND item_kind = '${kindParam}'`;
+            if (Number.isInteger(index) && index >= 0) { params.push(index); where += ` AND resource_index = $${params.length}`; }
         }
+        // Kisten sehen nur Clients, die sie kaufen koennen (neuer Build meldet aware=1); aeltere wuerden sie falsch anzeigen
+        if (!(String(req.query.aware || '') === '1')) where += ` AND item_kind NOT IN ('crate_res', 'crate_ship')`;
         if (Number.isInteger(exclude) && exclude > 0) {
             params.push(exclude);
             where += ` AND seller_commander_id <> $${params.length}`;
@@ -10596,6 +10631,7 @@ app.post('/market/create', async (req, res) => {
             if (active.rows[0].n >= MARKET_MAX_ACTIVE_OFFERS)
                 return { status: 400, body: { success: false, error: `Du kannst höchstens ${MARKET_MAX_ACTIVE_OFFERS} Angebote gleichzeitig haben.` } };
 
+            const isCrate = marketIsCrate(kind);
             const player = await marketLoadPlayer(who.playFabId, [coord]);
             if (!player) return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } };
             const { commander, planets } = player;
@@ -10603,11 +10639,17 @@ app.post('/market/create', async (req, res) => {
             const planet = planets[coord];
             if (!planet) return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } };
 
+            if (isCrate) {
+                // Kisten kommen aus dem Inventar - NUR handelbare (_t); Geschenk-Kisten (ohne _t) sind nie im Handel
+                if (!(await marketInventoryRemove(who.playFabId, kind, index, amount)))
+                    return { status: 400, body: { success: false, error: 'Nicht genug handelbare Kisten im Inventar.' } };
+            } else {
             if (marketHave(planet, kind, index) < amount)
                 return { status: 400, body: { success: false, error: 'Nicht genug Vorrat auf diesem Planeten.' } };
 
             marketRemove(planet, kind, index, amount);
             await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+            }
 
             let offerId;
             try {
@@ -10621,8 +10663,8 @@ app.post('/market/create', async (req, res) => {
             } catch (insertError) {
                 console.error('[Handel] create: Angebot anlegen fehlgeschlagen, buche Ware zurueck:', insertError.message);
                 try {
-                    marketAdd(planet, kind, index, amount);
-                    await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet });
+                    if (isCrate) await marketInventoryAdd(who.playFabId, kind, index, amount);
+                    else { marketAdd(planet, kind, index, amount); await marketSaveEntries(who.playFabId, { [marketPlanetKey(coord)]: planet }); }
                 } catch (refundError) {
                     console.error('[Handel] create: RUECKBUCHUNG FEHLGESCHLAGEN (Commander ' + who.commanderId + ', ' + amount + 'x ' + kind + ' ' + index + '):', refundError.message);
                 }
@@ -10685,6 +10727,8 @@ app.post('/market/buy', async (req, res) => {
             // Uebergang: nur Clients, die "deliveryAware" melden (neuer Build, holt Lieferungen ueber /market/deliver ab), bekommen die Lieferzeit. Aeltere Clients
             // wuerden gekaufte Schiffe nie abholen -> sie bekommen sie wie bisher sofort. SOBALD ALLE AUF DEM NEUEN BUILD SIND (Mindestversion), diese Bedingung entfernen.
             const deliveryAware = !!(req.body && req.body.deliveryAware === true);
+            if (marketIsCrate(offer.item_kind) && !deliveryAware)   // Kisten kommen nur ueber die Lieferung ins Inventar - dafuer braucht es den neuen Build
+                return { status: 400, body: { success: false, error: 'Zum Kauf von Kisten bitte das Spiel neu laden (neue Version).' } };
             const deliveryHours = deliveryAware ? marketDeliveryHours(offer.item_kind, offer.seller_coord, target) : 0;
 
             // Nur EIN gleichzeitiger Kaeufer gewinnt (Bedingung steckt im UPDATE selbst).
@@ -10761,6 +10805,11 @@ app.post('/market/cancel', async (req, res) => {
             try {
                 const player = await marketLoadPlayer(who.playFabId, []);
                 if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
+                if (marketIsCrate(offer.item_kind)) {   // NEU 08.11.2026: Kisten gehen zurueck ins Inventar
+                    await marketInventoryAdd(who.playFabId, offer.item_kind, offer.resource_index, offer.amount);
+                    console.log(`[Handel] Angebot ${offerId} von Commander ${who.commanderId} zurueckgezogen (Kisten)`);
+                    return { status: 200, body: { success: true, offerId, returned: { coord: '', kind: offer.item_kind, itemIndex: offer.resource_index, amount: offer.amount, inventory: true } } };
+                }
                 const returnCoord = marketReturnCoord(player.commander, offer.seller_coord);
                 if (!returnCoord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Rückgabe gefunden.' } }; }
                 const planets = await marketLoadPlanets(who.playFabId, [returnCoord]);
@@ -10807,23 +10856,35 @@ app.post('/market/deliver', async (req, res) => {
             try {
                 const player = await marketLoadPlayer(who.playFabId, []);
                 if (!player) { await revert(); return { status: 404, body: { success: false, error: 'Commander nicht gefunden.' } }; }
+                const crateRows = rows.rows.filter(r => marketIsCrate(r.item_kind));   // NEU 08.11.2026: Kisten gehen ins Inventar (zweiter Schritt unten)
+                const planetRows = rows.rows.filter(r => !marketIsCrate(r.item_kind));
                 const targets = new Map();   // id -> Zielplanet
-                for (const r of rows.rows) {
+                for (const r of planetRows) {
                     const coord = marketReturnCoord(player.commander, r.buyer_coord);
                     if (!coord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Lieferung gefunden.' } }; }
                     targets.set(r.id, coord);
                 }
                 const planets = await marketLoadPlanets(who.playFabId, Array.from(new Set(targets.values())));
                 const entries = {}, out = [];
-                for (const r of rows.rows) {
+                for (const r of planetRows) {
                     const coord = targets.get(r.id), planet = planets[coord];
                     if (!planet) { await revert(); return { status: 404, body: { success: false, error: 'Planet nicht gefunden.' } }; }
                     marketAdd(planet, r.item_kind, r.resource_index, r.amount);
                     entries[marketPlanetKey(coord)] = planet;
                     out.push({ id: r.id, coord, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, sellerName: r.seller_name });
                 }
-                await marketSaveEntries(who.playFabId, entries);
-                console.log(`[Handel] Lieferung an Commander ${who.commanderId}: ${out.length} Schiff(e) angekommen`);
+                if (Object.keys(entries).length > 0) await marketSaveEntries(who.playFabId, entries);
+                // Kisten: eigener Schritt mit eigener Rueckgabe - die Planeten sind schon gebucht und duerfen bei einem Inventar-Fehler NICHT noch einmal gebucht werden
+                for (const r of crateRows) {
+                    try {
+                        await marketInventoryAdd(who.playFabId, r.item_kind, r.resource_index, r.amount);
+                        out.push({ id: r.id, coord: '', inventory: true, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount, sellerName: r.seller_name });
+                    } catch (crateError) {
+                        console.error('[Handel] deliver: Kisten-Gutschrift fehlgeschlagen (Angebot ' + r.id + '), bleibt offen:', crateError.message);
+                        try { await pool.query('UPDATE market_offers SET delivered = false WHERE id = ANY($1::int[])', [[r.id]]); } catch (e2) { console.error('[Handel] deliver: FREIGABE FEHLGESCHLAGEN:', e2.message); }
+                    }
+                }
+                console.log(`[Handel] Lieferung an Commander ${who.commanderId}: ${out.length} Lieferung(en) angekommen`);
                 return { status: 200, body: { success: true, deliveries: out } };
             } catch (error) {
                 await revert();
@@ -10878,7 +10939,9 @@ app.post('/market/claim', async (req, res) => {
 
                 // Gutschriften je Zielplanet buendeln: abgelaufene Ware -> zurueck, verkauft -> Erloes in der verlangten Ressource.
                 const adds = new Map(); // coord -> [ { kind, itemIndex, amount, isPayout } ]
+                const crateReturns = [];   // NEU 08.11.2026: abgelaufene Kisten gehen ins Inventar
                 for (const r of rows.rows) {
+                    if (r.status === 'expired' && marketIsCrate(r.item_kind)) { crateReturns.push(r); continue; }
                     const coord = marketReturnCoord(commander, r.seller_coord);
                     if (!coord) { await revert(); return { status: 400, body: { success: false, error: 'Keine Kolonie für die Rückgabe gefunden.' } }; }
                     if (!adds.has(coord)) adds.set(coord, []);
@@ -10908,7 +10971,16 @@ app.post('/market/claim', async (req, res) => {
                 }
                 const payoutsOut = Array.from(payoutsMap.values());
 
-                await marketSaveEntries(who.playFabId, entries);
+                if (Object.keys(entries).length > 0) await marketSaveEntries(who.playFabId, entries);
+                for (const r of crateReturns) {   // eigener Schritt: schlaegt er fehl, bleibt NUR dieses Angebot offen (die Planeten sind schon gebucht)
+                    try {
+                        await marketInventoryAdd(who.playFabId, r.item_kind, r.resource_index, r.amount);
+                        returnsOut.push({ coord: '', inventory: true, kind: r.item_kind, itemIndex: r.resource_index, amount: r.amount });
+                    } catch (crateError) {
+                        console.error('[Handel] claim: Kisten-Rueckgabe fehlgeschlagen (Angebot ' + r.id + '), bleibt offen:', crateError.message);
+                        try { await pool.query(`UPDATE market_offers SET settled = false, settled_at = NULL, status = 'active' WHERE id = ANY($1::int[])`, [[r.id]]); } catch (e2) { console.error('[Handel] claim: FREIGABE FEHLGESCHLAGEN:', e2.message); }
+                    }
+                }
                 // NEU 20.10.2026 (§35): die Steuer der verkauften Angebote fliesst in die Kasse der Allianz des Verkaeufers (ohne Allianz verfaellt sie wie bisher;
                 // ein Fehler dort darf die Abholung nie kippen - die Funktion faengt ihre Fehler selbst ab)
                 if (typeof allianceTreasuryDepositTax === 'function') {
@@ -10971,8 +11043,25 @@ const INVENTORY_ITEMS = (() => {
         items['crate_res_' + i] = { group: 'resource', kind: 'resource', index: i, amount: INVENTORY_CRATE_AMOUNTS[i] };
     [0, 1, 2, 3].forEach(i => { items['crate_warship_' + i] = { group: 'ship', kind: 'warship', index: i, amount: 1 }; });
     [1, 3].forEach(i => { items['crate_ship_' + i] = { group: 'ship', kind: 'ship', index: i, amount: 1 }; });
+    // NEU 08.11.2026 (Nutzer): HANDELBARE und NICHT HANDELBARE Kisten. Alle bisherigen Kisten (Shop, Erfolge, stuendliche Geschenkkiste, Quests, Admin) sind Geschenke des
+    // Servers und NICHT handelbar ("NT"). Handelbare Kisten ("T", Kennung mit Endung _t, z. B. crate_res_2_t) entstehen nur durch eigene Leistung (spaeter Beute von Piraten)
+    // und sind die EINZIGEN Kisten, die im Spielerhandel angeboten werden koennen - so wandern Server-Geschenke nicht von einem Konto zum naechsten (Mehrfachkonten).
+    // Handelbar gibt es nur fuer die Kisten, die man tauschen soll: Kleine Kisten Ress01-05, Schiffskisten Warship01-04, Container, Kolonisationsschiff.
+    for (const id of Object.keys(items)) items[id].tradable = false;
+    const tradableBases = [0, 1, 2, 3, 4].map(i => 'crate_res_' + i).concat([0, 1, 2, 3].map(i => 'crate_warship_' + i), ['crate_ship_1', 'crate_ship_3']);
+    for (const id of tradableBases) items[id + '_t'] = Object.assign({}, items[id], { tradable: true, base: id });
     return items;
 })();
+
+// Kennung (nur intern, der Spieler sieht sie nie): C4RESS01..10 = Kiste fuer Ress01..10, C4WS01..04 = Kiste fuer Warship01..04, C4S01 = Containerkiste, C4S03 = Kiste Kolonisationsschiff;
+// danach T (handelbar) oder NT (nicht handelbar). Der Inventar-Schluessel ohne Endung = NT (Altbestand bleibt unveraendert), mit "_t" = T.
+function inventoryCrateCode(itemId) {
+    const def = INVENTORY_ITEMS[itemId];
+    if (!def) return String(itemId);
+    const p2 = n => String(n).padStart(2, '0');
+    const base = def.kind === 'resource' ? 'C4RESS' + p2(def.index + 1) : def.kind === 'warship' ? 'C4WS' + p2(def.index + 1) : 'C4S' + p2(def.index);
+    return base + (def.tradable ? 'T' : 'NT');
+}
 
 // -------------------------------------------------------
 // VIRGO-SHOP: ICC-Preise fuer Schiffe (Flotten-Pakete und Schiffskisten) - Nutzer-Vorgabe 04.10.2026:
@@ -11008,8 +11097,9 @@ function shopResourceIccPrice(resourceIndex, amount) {
 function inventoryItemLabel(itemId) {
     const def = INVENTORY_ITEMS[itemId];
     if (!def) return itemId;
-    if (def.kind === 'resource') return `${def.index <= 4 ? 'Kleine Kiste' : 'Rohstoffkiste'}: ${INVENTORY_RESOURCE_NAMES[def.index]} (${marketNum(def.amount)})`;
-    return `Schiffskiste ${marketItemName(def.kind, def.index)}`;
+    const tail = def.tradable ? ' [handelbar]' : '';
+    if (def.kind === 'resource') return `${def.index <= 4 ? 'Kleine Kiste' : 'Rohstoffkiste'}: ${INVENTORY_RESOURCE_NAMES[def.index]} (${marketNum(def.amount)})${tail}`;
+    return `Schiffskiste ${marketItemName(def.kind, def.index)}${tail}`;
 }
 
 // Braucht der Inhalt einen Zielplaneten? (Ress01-05 und Schiffe: ja; Ress06-10 gehoeren dem Konto: nein)
@@ -11159,7 +11249,7 @@ app.get('/inventory', async (req, res) => {
             .map(id => ({ itemId: id, count: Number(inv.items[id]) }));
         const catalog = Object.keys(INVENTORY_ITEMS).map(id => {
             const d = INVENTORY_ITEMS[id];
-            return { itemId: id, group: d.group, kind: d.kind, index: d.index, amount: d.amount, needsPlanet: inventoryNeedsPlanet(d) };
+            return { itemId: id, group: d.group, kind: d.kind, index: d.index, amount: d.amount, needsPlanet: inventoryNeedsPlanet(d), tradable: !!d.tradable };
         });
         res.json({ success: true, items, catalog, maxUse: INVENTORY_MAX_USE_QUANTITY });
     } catch (error) {
@@ -11278,7 +11368,7 @@ app.post('/admin/inventory/grant', async (req, res) => {
 
 async function buildInventoryAdminReport(rawQuery) {
     const tokens = String(rawQuery || '').trim().split(/\s+/).slice(1); // ohne "#inv"
-    const itemList = () => Object.keys(INVENTORY_ITEMS).map(id => `  ${id}  =  ${inventoryItemLabel(id)}${INVENTORY_ADMIN_ONLY_ITEMS.has(id) ? '  [nur Admin]' : ''}`).join('\n');
+    const itemList = () => Object.keys(INVENTORY_ITEMS).map(id => `  ${id}  [${inventoryCrateCode(id)}]  =  ${inventoryItemLabel(id)}${INVENTORY_ADMIN_ONLY_ITEMS.has(id) ? '  [nur Admin]' : ''}`).join('\n');
     const help =
         'INVENTAR-Admin:\n' +
         '  #inv <Commander-ID>                          Inventar anzeigen\n' +
@@ -11294,7 +11384,7 @@ async function buildInventoryAdminReport(rawQuery) {
             if (!target) return `Spieler "${tokens[1]}" nicht gefunden (Commander-IDs werden ueber den Highscore gesucht; sonst die PlayFab-ID nehmen).`;
             const quantity = tokens[3] === undefined ? 1 : parseInt(tokens[3], 10);
             if (!Number.isInteger(quantity) || quantity < 1) return 'Ungueltige Anzahl.';
-            const ids = tokens[2].toLowerCase() === 'all' ? Object.keys(INVENTORY_ITEMS).filter(id => !INVENTORY_ADMIN_ONLY_ITEMS.has(id)) : [tokens[2]];
+            const ids = tokens[2].toLowerCase() === 'all' ? Object.keys(INVENTORY_ITEMS).filter(id => !INVENTORY_ADMIN_ONLY_ITEMS.has(id) && !INVENTORY_ITEMS[id].tradable) : [tokens[2]];
             const lines = [];
             for (const id of ids) {
                 const count = await inventoryGrant(target.playFabId, id, quantity);
