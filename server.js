@@ -1313,12 +1313,13 @@ async function initDatabase() {
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
             // dieselben 100 ICC. Schiffskisten (1 Schiff) kosten wie die Flotten-Pakete: Bauwert x 10, auf eine 9 aufgerundet.
             // Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC; Ress06-09 sind ungenutzt).
-            // 08.11.2026: Kisten halbiert (2.500/3.750/5.000/3.750/1.250) - der Preis folgt dem Inhalt (je Kiste 5 VC statt 10; Wert je VC bleibt gleich)
-            ['crate_res_0',     'Kleine Kiste: Energie (2.500)',       'gegenstaende', shopResourceIccPrice(0, 2500), 'inventory', 0, 1],
-            ['crate_res_1',     'Kleine Kiste: Wasserstoff (3.750)',   'gegenstaende', shopResourceIccPrice(1, 3750), 'inventory', 0, 1],
-            ['crate_res_2',     'Kleine Kiste: Metalle (5.000)',       'gegenstaende', shopResourceIccPrice(2, 5000), 'inventory', 0, 1],
-            ['crate_res_3',     'Kleine Kiste: Werkzeuge (3.750)',     'gegenstaende', shopResourceIccPrice(3, 3750), 'inventory', 0, 1],
-            ['crate_res_4',     'Kleine Kiste: ICC (1.250)',           'gegenstaende', shopResourceIccPrice(4, 1250), 'inventory', 0, 1],
+            // 08.11.2026 (Nutzer): Kisten halbiert (2.500/3.750/5.000/3.750/1.250) UND kein Shop-Angebot unter 100 VC: statt Einzelkiste (5 VC) gibt es jetzt PAKETE mit 20 Kisten
+            // fuer 100 VC (Wert je VC wie bisher: 20 x 5 VC). Die Einzelkisten crate_res_0-4 sind im Shop abgeschaltet (Kisten im Inventar bleiben oeffenbar).
+            ['crate_res_0_x20', '20x Kleine Kiste: Energie (2.500)',     'gegenstaende', 100, 'inventory', 0, 20],
+            ['crate_res_1_x20', '20x Kleine Kiste: Wasserstoff (3.750)', 'gegenstaende', 100, 'inventory', 0, 20],
+            ['crate_res_2_x20', '20x Kleine Kiste: Metalle (5.000)',     'gegenstaende', 100, 'inventory', 0, 20],
+            ['crate_res_3_x20', '20x Kleine Kiste: Werkzeuge (3.750)',   'gegenstaende', 100, 'inventory', 0, 20],
+            ['crate_res_4_x20', '20x Kleine Kiste: ICC (1.250)',         'gegenstaende', 100, 'inventory', 0, 20],
             // 22.10.2026 (Nutzer): die Einzelkisten der kleinen Jaeger (Orbitaljaeger/Raumjaeger/Kosmosjaeger) gibt es im Shop NICHT mehr - Kriegsschiffe
             // kosten damit mindestens so viel wie ein Sternkreuzer (819) bzw. ein Jaeger-Paket (829-849). Die alten Angebote werden unten abgeschaltet.
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
@@ -1344,6 +1345,8 @@ async function initDatabase() {
         await pool.query("UPDATE shop_items SET active = false WHERE item_id = 'item_ship05'");
         // 22.10.2026: Einzelkisten der kleinen Jaeger aus dem Shop (Kisten im Inventar der Spieler bleiben oeffenbar)
         await pool.query("UPDATE shop_items SET active = false WHERE item_id IN ('crate_warship_0', 'crate_warship_1', 'crate_warship_2')");
+        // 08.11.2026 (Nutzer): Einzelkisten der Kleinen Kisten raus (kein Angebot unter 100 VC) - es gibt die 20er-Pakete (crate_res_N_x20)
+        await pool.query("UPDATE shop_items SET active = false WHERE item_id IN ('crate_res_0', 'crate_res_1', 'crate_res_2', 'crate_res_3', 'crate_res_4')");
 
         // NEU (04.10.2026): Preise der Flotten-Pakete und Kisten (siehe Seeds oben). Bestehende Zeilen werden NUR aktualisiert, wenn sie noch
         // einen frueheren Standardpreis dieses Artikels haben - spaetere manuelle Aenderungen in der Datenbank bleiben erhalten.
