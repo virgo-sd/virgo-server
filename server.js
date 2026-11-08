@@ -1313,11 +1313,12 @@ async function initDatabase() {
             // Inhalt = Ressourcenpaket des Shops (Energie 5.000, Wasserstoff 7.500, Metalle 10.000, Werkzeuge 7.500, Credits 2.500) fuer
             // dieselben 100 ICC. Schiffskisten (1 Schiff) kosten wie die Flotten-Pakete: Bauwert x 10, auf eine 9 aufgerundet.
             // Kisten fuer Ress06-10 gibt es bewusst NICHT im Shop (ICC kauft man nicht mit ICC; Ress06-09 sind ungenutzt).
-            ['crate_res_0',     'Kleine Kiste: Energie (5.000)',       'gegenstaende', shopResourceIccPrice(0, 5000),  'inventory', 0, 1],
-            ['crate_res_1',     'Kleine Kiste: Wasserstoff (7.500)',   'gegenstaende', shopResourceIccPrice(1, 7500),  'inventory', 0, 1],
-            ['crate_res_2',     'Kleine Kiste: Metalle (10.000)',      'gegenstaende', shopResourceIccPrice(2, 10000), 'inventory', 0, 1],
-            ['crate_res_3',     'Kleine Kiste: Werkzeuge (7.500)',     'gegenstaende', shopResourceIccPrice(3, 7500),  'inventory', 0, 1],
-            ['crate_res_4',     'Kleine Kiste: ICC (2.500)',           'gegenstaende', shopResourceIccPrice(4, 2500),  'inventory', 0, 1],
+            // 08.11.2026: Kisten halbiert (2.500/3.750/5.000/3.750/1.250) - der Preis folgt dem Inhalt (je Kiste 5 VC statt 10; Wert je VC bleibt gleich)
+            ['crate_res_0',     'Kleine Kiste: Energie (2.500)',       'gegenstaende', shopResourceIccPrice(0, 2500), 'inventory', 0, 1],
+            ['crate_res_1',     'Kleine Kiste: Wasserstoff (3.750)',   'gegenstaende', shopResourceIccPrice(1, 3750), 'inventory', 0, 1],
+            ['crate_res_2',     'Kleine Kiste: Metalle (5.000)',       'gegenstaende', shopResourceIccPrice(2, 5000), 'inventory', 0, 1],
+            ['crate_res_3',     'Kleine Kiste: Werkzeuge (3.750)',     'gegenstaende', shopResourceIccPrice(3, 3750), 'inventory', 0, 1],
+            ['crate_res_4',     'Kleine Kiste: ICC (1.250)',           'gegenstaende', shopResourceIccPrice(4, 1250), 'inventory', 0, 1],
             // 22.10.2026 (Nutzer): die Einzelkisten der kleinen Jaeger (Orbitaljaeger/Raumjaeger/Kosmosjaeger) gibt es im Shop NICHT mehr - Kriegsschiffe
             // kosten damit mindestens so viel wie ein Sternkreuzer (819) bzw. ein Jaeger-Paket (829-849). Die alten Angebote werden unten abgeschaltet.
             ['crate_warship_3', 'Schiffskiste Sternkreuzer',  'gegenstaende', shopShipIccPrice('warship', 3, 1), 'inventory', 0, 1],
@@ -1353,7 +1354,7 @@ async function initDatabase() {
             fleet_warship01: [250, 14569, 149, 1019, 9], fleet_warship02: [250, 31339, 629, 4369, 19], fleet_warship03: [250, 24209, 2429, 16849, 39], fleet_warship04: [250, 6469, 45009, 459], fleet_ship01: [250, 26479, 2649, 29], fleet_ship03: [250, 10819],
             ress00: [100], ress01: [100], ress02: [100], ress03: [100], ress04: [100],
             item_ship05: [1000],
-            crate_res_0: [200, 100], crate_res_1: [134, 100], crate_res_2: [100], crate_res_3: [134, 100], crate_res_4: [400, 100],
+            crate_res_0: [200, 100, 10], crate_res_1: [134, 100, 10], crate_res_2: [100, 10], crate_res_3: [134, 100, 10], crate_res_4: [400, 100, 10],   // 10 = Preis bis 08.11.2026 (vor dem Halbieren)
             crate_warship_0: [15, 149, 1019, 9], crate_warship_1: [63, 629, 4369, 19], crate_warship_2: [242, 2429, 16849, 39], crate_warship_3: [647, 6469, 45009, 459], crate_ship_1: [265, 2649, 29], crate_ship_3: [1082, 10819]
         };
         for (const row of defaultShopItems) {
@@ -8167,6 +8168,11 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
                 lootedRessources[idx] = taken;
             }
         }
+        // NEU 08.11.2026 (§58): Beute von echten Spielern traegt den Geschenk-Anteil des Opfers mit (keine "Geldwaesche" ueber Plünderung)
+        if (defenderPfid && defenderCommander && !npcCtx && !expelMode && lootedRessources.some(n => n > 0)) {
+            try { await giftTransferOnLoot(defenderPfid, defenderCommander, ownerInfo ? ownerInfo.ownerCommanderId : defenderCommander.commanderId, attackerCommander.commanderId, lootedRessources); }
+            catch (e) { console.error('[Geschenk-Anteil] Beute-Uebertrag fehlgeschlagen:', e.message); log.push(`Geschenk-Anteil bei Beute nicht übertragen: ${e.message}`); }
+        }
     }
 
     // PHASE 7: Recycling (geht an den Verteidiger-Planeten, nur wenn bekannt; Piraten bekommen keine Truemmer)
@@ -9297,8 +9303,10 @@ const V2_WARSHIPS = [
     { id: 'Warship04', carrier: true,  w: [90, 45, 120], s: [70, 56, 42] }
 ];
 const V2_IDEAL_RATIO = [6, 3, 2, 1];                          // Warship01 : 02 : 03 : 04
-const V2_CARGO_WARSHIP = [100, 170, 280, 460, 100, 100, 100, 100, 100, 100]; // Tragkapazitaet je Kriegsschiff (Assets)
-const V2_CARGO_CIVIL = 1000;                                   // Platzhalter je Zivilschiff wie bisher
+// NEU 08.11.2026 (Nutzer): EIN Laderaum je Schiff - die Asset-Werte (Warship01-04: 1.000/1.700/2.800/4.600; Ship00-05: 50/50.000/100.000/10.000 ...) gelten fuer Transport UND Beute
+// (Kopie von TRANSPORT_CARGO_WARSHIP / TRANSPORT_CARGO_SHIP, §29 - ein Test vergleicht beide). Frueher rechnete die Beute nur mit einem Zehntel (100/170/280/460) und 1.000 je Zivilschiff.
+const V2_CARGO_WARSHIP = [1000, 1700, 2800, 4600, 77, 129, 215, 359, 599, 999];
+const V2_CARGO_SHIP    = [50, 50000, 100000, 10000, 10000, 10000];
 
 function getCombatEngineMode() {
     const m = String(process.env.COMBAT_ENGINE || 'v1').toLowerCase();
@@ -9703,8 +9711,8 @@ function v2ResearchOf(commander) {
 // Beute-Tragkapazitaet der ueberlebenden Schiffe
 function v2CargoCapacity(warships, ships) {
     let cap = 0;
-    for (let i = 0; i < 10; i++) cap += (warships[i] || 0) * V2_CARGO_WARSHIP[i];
-    for (let i = 0; i < 6; i++) cap += (ships[i] || 0) * V2_CARGO_CIVIL;
+    for (let i = 0; i < 10; i++) cap += (warships[i] || 0) * (V2_CARGO_WARSHIP[i] || 0);
+    for (let i = 0; i < 6; i++) cap += (ships[i] || 0) * (V2_CARGO_SHIP[i] || 0);
     return cap;
 }
 
@@ -11193,6 +11201,27 @@ async function giftShareList(commanderId) {
     for (const k of Object.keys(m)) m[k].forEach((n, i) => { if (n > 0) out.push({ kind: k, index: i, amount: n }); });
     return out;
 }
+
+// NEU 08.11.2026 (Nutzer: "Plünder-Lücke zuerst schließen"): Plünderung darf den Geschenk-Anteil NICHT umgehen. Sonst bekommt Zweitkonto B Server-Geschenke, Hauptkonto A
+// plündert B und hält "saubere" Rohstoffe. Der Anteil wandert deshalb mit: je Ressource nimmt der Angreifer denselben ANTEIL Geschenk mit, den der Verteidiger an seinem
+// Gesamtbestand (vor dem Raub) hatte; der Verteidiger verliert genau diese Menge aus seinem Anteil (nichts wird doppelt gezählt). Gibt die verschobenen Mengen je Ressource zurück.
+async function giftTransferOnLoot(victimPlayFabId, victimCommander, victimId, attackerId, looted) {
+    const moved = [0, 0, 0, 0, 0];
+    if (!(Number(victimId) >= 1000000) || !(Number(attackerId) >= 1000000) || Number(victimId) === Number(attackerId)) return moved;
+    if (!Array.isArray(looted) || !looted.some(n => Number(n) > 0)) return moved;
+    const totals = await giftStockTotals(victimPlayFabId, victimCommander), share = await giftShareMap(victimId);
+    for (let i = 0; i < 5; i++) {
+        const taken = Math.max(0, Math.floor(Number(looted[i]) || 0));
+        const total = totals.resource[i], have = share.resource[i];
+        if (taken <= 0 || !(total > 0) || !(have > 0)) continue;
+        const x = Math.min(taken, have, Math.floor(taken * Math.min(1, have / total)));
+        if (x <= 0) continue;
+        await giftShareAdd(victimId, 'resource', i, -x);
+        await giftShareAdd(attackerId, 'resource', i, x);
+        moved[i] = x;
+    }
+    return moved;
+}
 // GIFT58-ENDE
 
 // #####################################################################
@@ -11202,9 +11231,9 @@ async function giftShareList(commanderId) {
 //      es ueberlebt einen Datenbank-Wechsel (Postgres wird nicht gebraucht) und ist damit fairplay-sicher.
 //
 //      Gegenstaende (Katalog INVENTORY_ITEMS, fuer den Anfang nur Kisten):
-//        crate_res_0 ... crate_res_4   "Kleine Kiste" fuer Ress01 ... Ress05 (erste Serie): Energie 5.000, Wasserstoff 7.500,
-//                                      Metalle 10.000, Werkzeuge 7.500, Credits 2.500 - exakt der Inhalt eines Ressourcenpakets
-//                                      im Virgo-Shop (je 100 ICC), landen auf dem gewaehlten Planeten
+//        crate_res_0 ... crate_res_4   "Kleine Kiste" fuer Ress01 ... Ress05 (erste Serie): Energie 2.500, Wasserstoff 3.750,
+//                                      Metalle 5.000, Werkzeuge 3.750, ICC 1.250 (seit 08.11.2026 halbiert; vorher = Inhalt eines Ressourcenpakets
+//                                      im Virgo-Shop), landen auf dem gewaehlten Planeten
 //        crate_res_5 ... crate_res_9   Rohstoffkiste fuer Ress06 ... Ress10 mit je 10.000 Einheiten, gehen auf das Konto des
 //                                      Commanders (nur Admin; die ICC-Kiste (Ress10) ist bewusst NUR per Admin vergebbar)
 //        crate_warship_0 ... _3        Kiste mit je 1x Warship01 ... Warship04
@@ -11225,7 +11254,9 @@ const INVENTORY_KEY              = 'inventory';
 const INVENTORY_MAX_STACK        = 1000000;   // maximale Anzahl je Gegenstand im Inventar
 const INVENTORY_MAX_USE_QUANTITY = 999;       // so viele Kisten auf einmal oeffnen
 // Einheiten je Rohstoffkiste, Index = Ress-Index. MUSS zu CrateItems.CrateAmount (Client, CrateItems.cs) passen - ein Test vergleicht beide.
-const INVENTORY_CRATE_AMOUNTS    = [5000, 7500, 10000, 7500, 2500, 10000, 10000, 10000, 10000, 10000];
+// NEU 08.11.2026 (Nutzer): Kleine Kisten (Ress01-05) HALBIERT: 2.500 / 3.750 / 5.000 / 3.750 / 1.250. Die Produktion der Kommandozentrale (ECON_HQ_DAILY, §41) ist davon
+// ENTKOPPELT und bleibt unveraendert - die Kisten-Inhalte werden noch oft angepasst, die Tagesproduktion nicht automatisch mit.
+const INVENTORY_CRATE_AMOUNTS    = [2500, 3750, 5000, 3750, 1250, 10000, 10000, 10000, 10000, 10000];
 // Namen wie in ResourceNames.cs (Client) - nur fuer Admin-Texte; der Client baut die Anzeigenamen selbst.
 const INVENTORY_RESOURCE_NAMES = ['Energie', 'H2', 'Metalle', 'Werkzeuge', 'ICC', 'Antimaterie', 'Kristalle', 'Chips', 'Daten', 'VC'];   // 22.10.2026: Index 4 = ICC (Handelswaehrung), Index 9 = VC (Premium)
 const INVENTORY_ADMIN_ONLY_ITEMS = new Set(['crate_res_9']); // ICC-Kiste: Premium-Waehrung, nie per "all"/Shop/Quest
