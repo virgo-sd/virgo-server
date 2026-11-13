@@ -163,6 +163,7 @@ const AUTH_POLICY = [
     ['POST', /^\/supportMessage$/,             'public'],   // Support-Formular auch ohne Login
     ['POST', /^\/auth\/(remembered-login|forget)$/, 'public'],  // NEU 23.10.2026 (§39): Anmeldung mit Geraete-Kennung, vor dem Login
     ['POST', /^\/auth\/exists$/,               'public'],   // NEU 25.10.2026 (§41): "gibt es dieses Konto?" vor dem Login (streng begrenzt)
+    ['POST', /^\/auth\/forgot$/,               'public'],   // NEU 13.11.2026 (§59): "Passwort senden" vor dem Login (immer dieselbe neutrale Antwort)
     ['*',    /^\/serverTick$/,                 'internal'], // cron-job.org, kein Spieler-Ticket
     ['*',    /^\/devtodos(\/.*)?$/,            'keyed'],    // eigener ADMIN_KEY
     ['GET',  /^\/admin\/reports$/,             'keyed'],    // eigener ADMIN_KEY
@@ -480,7 +481,9 @@ app.use(async (req, res, next) => {
             } else {
                 req.auth.playFabId = playFabId;
                 noteLang(req, playFabId);   // 04.11.2026 (Mehrsprachigkeit): Sprache des Kontos merken (Header X-Lang), nie blockierend
-                problem = await authCheckClaims(req, playFabId, group);
+                // NEU 13.11.2026 (§59): EIN Geraet je Konto - wurde das Konto inzwischen auf einem anderen Geraet angemeldet, ist dieses Ticket abgeloest
+                if (!/^\/session\//.test(req.path) && await sessionIsReplaced(playFabId, ticket)) problem = { reason: 'SESSION-ERSETZT' };
+                else problem = await authCheckClaims(req, playFabId, group);
             }
         }
     } catch (error) {
@@ -492,9 +495,9 @@ app.use(async (req, res, next) => {
     if (!problem) return next();
     authLog(req, `${problem.reason} [${group}]`, problem.detail, enforcing);
     if (!enforcing) return next();
-    const unauthenticated = problem.reason === 'KEIN-TICKET' || problem.reason === 'TICKET-UNGUELTIG';
+    const unauthenticated = problem.reason === 'KEIN-TICKET' || problem.reason === 'TICKET-UNGUELTIG' || problem.reason === 'SESSION-ERSETZT';
     return res.status(unauthenticated ? 401 : 403)
-        .json({ success: false, error: 'Nicht autorisiert.', code: problem.reason });
+        .json({ success: false, error: problem.reason === 'SESSION-ERSETZT' ? 'Dein Konto wurde auf einem anderen Gerät angemeldet.' : 'Nicht autorisiert.', code: problem.reason });
 });
 console.log(`[Auth] Modus: ${AUTH_MODE}, erzwungene Gruppen: ${AUTH_ENFORCE_GROUPS.length ? AUTH_ENFORCE_GROUPS.join(',') : '(keine)'}`);
 
@@ -760,6 +763,7 @@ function adminKeyOk(provided) {
 async function requireCaller(req, res, claimed = {}) {
     const caller = await marketIdentity(req);
     if (!caller) {
+        if (req.sessionReplaced) { res.status(401).json({ success: false, error: 'Dein Konto wurde auf einem anderen Gerät angemeldet.', code: 'SESSION-ERSETZT' }); return null; }
         try { authLog(req, 'CALLER-KEIN-TICKET', '', true); } catch (e) { /* nur Diagnose */ }
         res.status(401).json({ success: false, error: 'Nicht angemeldet.', code: 'KEIN-TICKET' });
         return null;
@@ -1716,6 +1720,8 @@ async function initDatabase() {
             id SERIAL PRIMARY KEY, playfab_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL);`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_remember_tokens_playfab ON remember_tokens (playfab_id);`);
+        // NEU 13.11.2026 (§59 EIN Geraet je Konto): welches Anmeldeticket (nur Pruefsumme) gilt gerade; fluechtig, nicht in DB_EXPORT_TABLES
+        await pool.query(`CREATE TABLE IF NOT EXISTS active_sessions (playfab_id TEXT PRIMARY KEY, ticket_hash TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -8907,6 +8913,7 @@ async function deleteAccountCompletely(playFabId) {
 
     authTicketCache.clear();
     authCommanderCache.delete(playFabId);
+    try { await pool.query('DELETE FROM active_sessions WHERE playfab_id = $1', [playFabId]); sessionCache.delete(playFabId); } catch (e) { /* Tabelle fehlt/DB kurz weg: unwichtig */ }   // NEU 13.11.2026 (§59)
     return { summary: { colonies: handover, postgres: postgres.summary } };
 }
 
@@ -10329,11 +10336,13 @@ function withMarketLock(key, fn) {
 // Identitaet ausschliesslich aus dem Ticket (unabhaengig von AUTH_MODE). null = nicht angemeldet.
 async function marketIdentity(req) {
     let playFabId = req.auth && req.auth.playFabId;
+    const ticketHeader = req.get('X-Session-Ticket');
     if (!playFabId) {
-        const ticket = req.get('X-Session-Ticket');
-        if (ticket) playFabId = await authenticateTicket(ticket);
+        if (ticketHeader) playFabId = await authenticateTicket(ticketHeader);
     }
     if (!playFabId) return null;
+    // NEU 13.11.2026 (§59): abgeloeste Sitzung (Konto ist auf einem anderen Geraet angemeldet) -> keine Identitaet; requireCaller antwortet mit code SESSION-ERSETZT
+    if (ticketHeader && await sessionIsReplaced(playFabId, ticketHeader)) { req.sessionReplaced = true; return null; }
     const commanderId = await authCommanderIdFor(playFabId);
     if (commanderId === null || commanderId === undefined) return null;
     return { playFabId, commanderId: Number(commanderId) };
@@ -15040,21 +15049,10 @@ app.post('/auth/exists', async (req, res) => {
     // spielt - personenbezogen. Das Anmeldefenster behandelt die Antwort wie "Format ok"; ob das Konto existiert, zeigt erst der Login (PlayFab).
     if (isMail) return res.json({ success: true, exists: true, kind: 'mail' });
     if (!/^[A-Za-z0-9_.\-]{3,20}$/.test(raw)) return res.json({ success: true, exists: false, kind: 'nick' });   // so ein Nick kann nicht existieren
-    try {
-        let exists = false;
-        try {
-            const r = await playfabServer('/Admin/GetUserAccountInfo', isMail ? { Email: raw } : { Username: raw });
-            exists = !!(r && r.UserInfo && r.UserInfo.PlayFabId);
-        } catch (e) {
-            const d = e && e.response && e.response.data;
-            if (e && e.response && e.response.status === 400 && d && /AccountNotFound/i.test(String(d.error || d.errorMessage || ''))) exists = false;
-            else throw e;
-        }
-        res.json({ success: true, exists, kind: isMail ? 'mail' : 'nick' });
-    } catch (error) {
-        console.error('[Exists] Fehler:', error.message);
-        res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
-    }
+    // NEU 13.11.2026 (Nutzer, Login-Sicherheit): AUCH Login-Nicks werden nicht mehr verraten. "Diesen Login-Nick kennen wir nicht" erleichterte das Ausspaehen von
+    // Zugangsdaten. Das Anmeldefenster zeigt das Passwortfeld jetzt sofort und meldet erst nach der Anmeldung neutral "Login-Daten nicht korrekt". Der Endpunkt bleibt nur
+    // fuer aeltere Clients und antwortet fuer jeden formal gueltigen Nick "ok" (kein PlayFab-Aufruf mehr).
+    res.json({ success: true, exists: true, kind: isMail ? 'mail' : 'nick' });
 });
 
 // #####################################################################
@@ -15086,6 +15084,140 @@ app.get('/account/email-status', async (req, res) => {
         res.status(500).json({ success: false, error: 'Gerade nicht möglich.' });
     }
 });
+
+// #####################################################################
+// §59  EIN GERAET JE KONTO + "PASSWORT SENDEN" (NEU 13.11.2026, Nutzer: Login-Sicherheit)
+//      EIN GERAET JE KONTO: Meldet sich ein Konto auf einem zweiten Geraet an, muss das erste abgemeldet werden. Nach jeder Anmeldung ruft der Client POST /session/claim
+//      (mit seinem Ticket); der Server merkt sich nur die PRUEFSUMME des Tickets je Konto (Tabelle active_sessions). Jede weitere Anfrage mit einem ANDEREN Ticket dieses Kontos
+//      wird mit 401 und code SESSION-ERSETZT abgewiesen (zentral in der Auth-Middleware und in marketIdentity/requireCaller); GET /session/check sagt dem Client, ob sein Ticket
+//      noch gilt (er fragt alle ~20 s). Konten ohne Eintrag (aeltere Clients, die nie "claimen") werden nicht eingeschraenkt. Grenze: Der Spielstand selbst wird vom Client
+//      direkt in PlayFab geschrieben - das Geraet wird deshalb sofort und ohne Speichern abgemeldet, sobald es die Ablösung bemerkt.
+//      PASSWORT SENDEN (POST /auth/forgot, ohne Anmeldung): immer dieselbe neutrale Antwort, sofort (kein Zeit-Orakel); danach im Hintergrund: gibt es zu der Adresse ein Konto ->
+//      PlayFabs Standard-Mail zum Passwort-Wechsel; gibt es keins -> "Rekrutierungs-Mail" (Einladung zur Registrierung, Deutsch/Englisch nach X-Lang) ueber den Mail-Dienst
+//      (Render-Variablen BREVO_API_KEY + MAIL_FROM, siehe sendExternalMail). Ohne Mail-Dienst passiert fuer unbekannte Adressen nichts. Missbrauchsschutz: je IP, je Adresse
+//      (nur als Pruefsumme im Speicher) und insgesamt je Tag begrenzt.
+// #####################################################################
+// SESSION59-START
+const sessionCache = new Map();   // playFabId -> { hash, at }
+const SESSION_CACHE_MS = 20000;
+function sessionTicketHash(ticket) { return require('crypto').createHash('sha256').update(String(ticket)).digest('hex').slice(0, 32); }
+
+async function sessionActiveHash(playFabId) {
+    const c = sessionCache.get(playFabId);
+    if (c && Date.now() - c.at < SESSION_CACHE_MS) return c.hash;
+    let hash = null;
+    try {
+        const r = await pool.query('SELECT ticket_hash FROM active_sessions WHERE playfab_id = $1', [playFabId]);
+        hash = r.rows.length > 0 ? r.rows[0].ticket_hash : null;
+    } catch (e) { return c ? c.hash : null; }   // Tabelle/DB nicht lesbar: nie aussperren
+    if (sessionCache.size > 20000) sessionCache.clear();
+    sessionCache.set(playFabId, { hash, at: Date.now() });
+    return hash;
+}
+
+// true = fuer dieses Konto gilt inzwischen ein ANDERES Ticket (anderes Geraet hat sich angemeldet)
+async function sessionIsReplaced(playFabId, ticket) {
+    if (!playFabId || !ticket) return false;
+    const active = await sessionActiveHash(playFabId);
+    return !!active && active !== sessionTicketHash(ticket);
+}
+
+async function sessionClaim(playFabId, ticket) {
+    const hash = sessionTicketHash(ticket);
+    await pool.query(
+        `INSERT INTO active_sessions (playfab_id, ticket_hash, claimed_at) VALUES ($1, $2, now())
+         ON CONFLICT (playfab_id) DO UPDATE SET ticket_hash = EXCLUDED.ticket_hash, claimed_at = now()`, [playFabId, hash]);
+    sessionCache.set(playFabId, { hash, at: Date.now() });
+}
+
+async function sessionCaller(req, res) {
+    const ticket = req.get('X-Session-Ticket');
+    const playFabId = ticket ? await authenticateTicket(ticket) : null;
+    if (!playFabId) { res.status(401).json({ success: false, error: 'Nicht angemeldet.', code: 'KEIN-TICKET' }); return null; }
+    return { playFabId, ticket };
+}
+
+app.post('/session/claim', async (req, res) => {
+    const c = await sessionCaller(req, res);
+    if (!c) return;
+    if (rateLimited('sessclaim|' + c.playFabId, 30, 600000)) return res.status(429).json({ success: false, error: 'Zu viele Anmeldungen. Bitte warte einen Moment.' });
+    try { await sessionClaim(c.playFabId, c.ticket); res.json({ success: true }); }
+    catch (e) { console.error('[Session] claim:', e.message); res.status(500).json({ success: false, error: 'Gerade nicht möglich.' }); }
+});
+
+app.get('/session/check', async (req, res) => {
+    const c = await sessionCaller(req, res);
+    if (!c) return;
+    if (rateLimited('sesscheck|' + c.playFabId, 120, 600000)) return res.json({ success: true, valid: true });   // zu haeufig gefragt: nicht aussperren
+    res.json({ success: true, valid: !(await sessionIsReplaced(c.playFabId, c.ticket)) });
+});
+
+// ---- Mail-Dienst (nur HTTPS, Render sperrt SMTP). Brevo: Absenderadresse einmal bestaetigen, dann kostenlos bis 300 Mails/Tag. Gibt true/false zurueck. ----
+async function sendExternalMail(to, subject, text) {
+    const brevo = process.env.BREVO_API_KEY, from = process.env.MAIL_FROM || '';
+    const m = /^(.*?)\s*<([^>]+)>$/.exec(from);
+    const sender = m ? { name: m[1] || 'VIRGO', email: m[2] } : { name: 'VIRGO: Space Dominion', email: from };
+    if (!brevo || !sender.email) { console.log('[Mail] Kein Mail-Dienst eingerichtet (BREVO_API_KEY + MAIL_FROM) - keine Mail verschickt.'); return false; }
+    try {
+        await axios.post('https://api.brevo.com/v3/smtp/email', {
+            sender, to: [{ email: to }], subject, textContent: text
+        }, { headers: { 'api-key': brevo, 'Content-Type': 'application/json' }, timeout: 15000 });
+        return true;
+    } catch (e) { console.error('[Mail] Versand fehlgeschlagen:', e && e.response ? e.response.status : e.message); return false; }
+}
+
+const GAME_URL = process.env.GAME_URL || 'https://virgo-sd.github.io/';
+function recruitMail(lang) {
+    if (lang === 'en') return {
+        subject: 'VIRGO: Space Dominion - we have no commander file on you yet',
+        text: 'Greetings, pilot,\n\nthis is the Virgo Dominion Recruitment Office.\n\n' +
+              'Someone - most likely you - tried to log in to VIRGO: Space Dominion with this e-mail address. Our registry, however, holds no commander file for it yet.\n\n' +
+              'Want to join the fleet? Then enlist here: ' + GAME_URL + '  (tab "Register"). It takes about 3 minutes. We will assign you a colony, a first ship and a place among the stars.\n\n' +
+              'If you never asked for this message, simply ignore or delete it. Nothing else will happen on our side, and we do not keep your address.\n\n' +
+              'Clear skies,\nThe Virgo Dominion Recruitment Office\n'
+    };
+    return {
+        subject: 'VIRGO: Space Dominion - zu dir liegt noch keine Kommandantenakte vor',
+        text: 'Willkommen, Pilot,\n\nhier spricht das Rekrutierungsbüro des Virgo Dominion.\n\n' +
+              'Jemand - vermutlich du - hat versucht, sich mit dieser E-Mail-Adresse in VIRGO: Space Dominion einzuloggen. In unserem Register steht zu dieser Adresse aber noch keine Kommandantenakte.\n\n' +
+              'Du willst Teil der Flotte werden? Dann melde dich hier an: ' + GAME_URL + '  (Reiter "Register"). Das dauert nur etwa 3 Minuten. Wir stellen dir eine Kolonie, ein erstes Schiff und einen Platz zwischen den Sternen bereit.\n\n' +
+              'Du hast diese Nachricht gar nicht angefordert? Dann ignoriere sie einfach oder lösche sie. Von uns passiert nichts weiter, und deine Adresse speichern wir nicht.\n\n' +
+              'Weite Sterne,\nDas Rekrutierungsbüro des Virgo Dominion\n'
+    };
+}
+
+// Arbeit im Hintergrund (nach der Antwort): Konto vorhanden -> PlayFab-Standardmail, sonst Rekrutierungs-Mail
+async function forgotProcess(email, lang) {
+    let exists = false;
+    try {
+        const r = await playfabServer('/Admin/GetUserAccountInfo', { Email: email });
+        exists = !!(r && r.UserInfo && r.UserInfo.PlayFabId);
+    } catch (e) {
+        const d = e && e.response && e.response.data;
+        if (!(e && e.response && e.response.status === 400 && d && /AccountNotFound/i.test(String(d.error || d.errorMessage || '')))) { console.error('[Forgot] Konto-Suche:', e.message); return 'fehler'; }
+    }
+    if (exists) {
+        try { await axios.post(`${PLAYFAB_BASE_URL}/Client/SendAccountRecoveryEmail`, { Email: email, TitleId: PLAYFAB_TITLE_ID }, { headers: { 'Content-Type': 'application/json' } }); return 'reset'; }
+        catch (e) { console.error('[Forgot] PlayFab-Mail:', e.message); return 'fehler'; }
+    }
+    const mail = recruitMail(lang);
+    return (await sendExternalMail(email, mail.subject, mail.text)) ? 'einladung' : 'keine-mail';
+}
+
+const FORGOT_DAILY_MAX = 300;
+app.post('/auth/forgot', async (req, res) => {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || email.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return res.status(400).json({ success: false, error: 'Bitte gib eine gültige E-Mail-Adresse ein.' });
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    const ip = String(req.headers['cf-connecting-ip'] || '').trim() || (xff.length > 1 ? xff[xff.length - 2] : (xff[0] || 'direkt'));
+    const lang = /^en/i.test(String(req.headers['x-lang'] || '')) ? 'en' : 'de';
+    // IMMER dieselbe Antwort, sofort - der Spieler (oder ein Angreifer) erfaehrt nie, ob zu der Adresse ein Konto existiert
+    res.json({ success: true });
+    const limited = rateLimited('forgot-ip|' + ip, 10, 600000) || rateLimited('forgot-mail|' + sessionTicketHash(email), 3, 86400000) || rateLimited('forgot-all', FORGOT_DAILY_MAX, 86400000);
+    if (limited) return;
+    try { await forgotProcess(email, lang); } catch (e) { console.error('[Forgot] Fehler:', e.message); }
+});
+// SESSION59-ENDE
 
 // #####################################################################
 // §44  PASSWORT-BESTAETIGUNG FUER HEIKLE AKTIONEN (verifyAccountPassword) — NEU 25.10.2026
