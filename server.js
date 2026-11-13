@@ -6815,7 +6815,9 @@ async function serverTickHandler(req, res) {
                     // Verletzt der Abschluss das (z.B. durch einen manipulierten Client), wird die Forschung verworfen statt angewendet.
                     const rType = commander.activeResearch.type, rLevel = commander.activeResearch.targetLevel;
                     const coupledOther = rType === 18 ? commander.terraforming : rType === 17 ? commander.verwaltung : null;
-                    if (coupledOther !== null && !colResearchAllowed(rLevel, coupledOther)) {
+                    if (rLevel > RESEARCH_MAX_LEVEL) {   // NEU 13.11.2026 (Nutzer): Forschungen enden bei Stufe 18 (Alpha), auch gegen manipulierte Clients
+                        console.warn(`[Forschung] Obergrenze: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} - verworfen`);
+                    } else if (coupledOther !== null && !colResearchAllowed(rLevel, coupledOther)) {
                         console.warn(`[Forschung] Kopplung verletzt: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} bei Gegenstueck ${coupledOther} - verworfen`);
                     } else {
                         applyResearch(commander, rType, rLevel);
@@ -7842,6 +7844,15 @@ async function getPlanetOwnerInfo(coord) {
 // =========================================================
 async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet, now, log = []) {
     const destCoord = attackerFleet.destinationCoord;
+
+    // NEU 13.11.2026 (§60): Flottenstart serverseitig pruefen (Antrieb, Reichweite, Slots, Treibstoff/Laderaum, Flugzeit). Verstoss: kein Kampf, Flotte kehrt heim.
+    const launchProblem = fleetLaunchProblem(attackerFleet, attackerCommander);
+    if (launchProblem) {
+        await fleetLaunchRejected(attackerCommander, attackerFleet, launchProblem, log);
+        await upsertAttackTrace(attackerFleet.fleetId, { combat_processed_at: new Date(), combat_success: false });
+        return buildReturnFleet(attackerFleet, now, [...(attackerFleet.warships || [0,0,0,0,0,0,0,0,0,0])], attackerFleet.ressources || [0,0,0,0,0]);
+    }
+
     let ownerInfo = await getPlanetOwnerInfo(destCoord);
 
     // NEU: Angriffs-Akte — Kampfbeginn vermerken
@@ -8197,7 +8208,7 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         let totalCargo = 0;
         if (useV2) {
             // v2: Tragkapazitaet der UEBERLEBENDEN Schiffe (Asset-Werte, siehe §25)
-            totalCargo = v2CargoCapacity(attackerAfterWarships, attackerAfterShips);
+            totalCargo = v2LootCapacity(attackerAfterWarships, attackerAfterShips);   // NEU 13.11.2026 (Nutzer, F3): Kriegsschiffe plündern nur mit einem Anteil ihres Laderaums
         } else {
             for (const n of attackerShipsBefore) totalCargo += (n || 0) * 1000; // Cargo-Platzhalter je Zivilschiff
             for (const n of attackerFleet.warships) totalCargo += (n || 0) * 100;
@@ -8436,6 +8447,101 @@ function buildReturnFleet(fleet, now, warshipsRemaining, lootRessources) {
         fuelFactor:       fleet.fuelFactor  || 1
     };
 }
+
+// #####################################################################
+// §60  FLOTTENSTART-PRUEFUNG (NEU 13.11.2026, Nutzer: "Flottenstart serverseitig - sofort")
+//      Der Client startet Flotten selbst (FleetManager.LaunchFleet) und schreibt sie in commander_data. Der Server prueft deshalb bei der ANKUNFT
+//      (Angriff und Stationieren, die einzigen Missionen, die der Server verarbeitet) nach denselben Regeln wie der Client (FlightModel.cs):
+//        1. Antrieb: Engine02-04 nur mit erforschtem Antrieb
+//        2. Reichweite (Punkte) des Antriebs ueberschritten?
+//        3. Mindestens ein Schiff fliegt den Antrieb selbst, die Traeger-Plaetze (Slots) reichen
+//        4. Treibstoff (Wasserstoff) + Ladung passen in den Laderaum der Flotte
+//        5. Flugzeit: Ankunft - Abflug mindestens 75 % der Soll-Flugzeit (Toleranz fuer geaenderte Galaxiegroesse)
+//      Verstoss: kein Kampf, die Flotte kehrt unveraendert heim, Mail "Flottenstart ungueltig", Eintrag im Server-Log. Im Zweifel (unlesbare Daten) wird NICHT blockiert.
+//      NICHT geprueft (eigene Etappe "Besitz serverseitig"): ob die Schiffe auf dem Startplaneten wirklich vorhanden waren.
+//      Zahlen = Spiegel von FlightModel.cs und den Schiffs-Assets (Ship Assets/*.asset). Aenderungen immer an BEIDEN Stellen.
+// #####################################################################
+const FLIGHT_RANGE = [0, 45, 180, 1000000, 1000000];                                   // Reichweite je Antrieb 1-4 in Punkten
+const FLIGHT_WARSHIP_FUEL = [[4,0,0,0],[6,0,0,0],[8,15,0,0],[20,50,60,90],[4,0,0,0],[4,0,0,0],[4,0,0,0],[4,0,0,0],[4,0,0,0],[4,0,0,0]];
+const FLIGHT_SHIP_FUEL    = [[1,0,0,0],[10,25,60,90],[15,40,100,150],[20,0,0,0],[20,50,0,0],[20,0,0,0]];
+const FLIGHT_WARSHIP_SLOTS = { transport: [0,0,7,20,300,1000,1500,2500,5000,20000], use: [1,2,4,0,0,0,0,0,0,0] };
+const FLIGHT_SHIP_SLOTS    = { transport: [0,4,250,0,0,0], use: [1,0,0,0,100,100] };
+const FLIGHT_TIME_TOLERANCE = 0.75;                                                    // Ankunft - Abflug muss mindestens so viel der Soll-Flugzeit betragen
+const FLIGHT_MIN_FUEL_SPEED = 0.25;                                                    // kleinster erlaubter Geschwindigkeitsfaktor beim Treibstoff (Client: 100/50/25 %)
+
+function flightCounts(arr, n) {
+    const out = [];
+    for (let i = 0; i < n; i++) { const v = Array.isArray(arr) ? Number(arr[i]) : 0; out.push(Number.isFinite(v) && v > 0 ? Math.floor(v) : 0); }
+    return out;
+}
+
+// Entfernung in Punkten: 1 Planetenschritt = 1, 1 Systemschritt = 10, 1 Sektorschritt = 100 (mindestens 1); Ringlaenge wie calculateFlightTime
+function fleetDistancePoints(from, to) {
+    const f = String(from).split(':').map(Number), t = String(to).split(':').map(Number);
+    if (f.length !== 4 || t.length !== 4 || f.some(n => !Number.isFinite(n)) || t.some(n => !Number.isFinite(n))) return null;
+    const nSectors = galaxyStructure ? Math.max(1, galaxyHighestOpen()) : 4;
+    const nSystems = galaxyStructure ? Math.max(1, galaxySystemsIn(f[1]), galaxySystemsIn(t[1])) : 12;
+    const sectorDist = f[1] !== t[1] ? Math.min(Math.abs(f[1] - t[1]), nSectors - Math.abs(f[1] - t[1])) : 0;
+    const systemDist = f[2] !== t[2] ? Math.min(Math.abs(f[2] - t[2]), nSystems - Math.abs(f[2] - t[2])) : 0;
+    const planetDist = Math.abs(f[3] - t[3]);
+    return Math.max(1, sectorDist * 100 + systemDist * 10 + planetDist);
+}
+
+function flightFuelPerPoint(table, idx, engine) {
+    const r = table[idx]; if (!r) return 0;
+    for (let e = Math.min(engine, 4); e >= 1; e--) if (r[e - 1] > 0) return r[e - 1];
+    return 0;
+}
+function flightCanFly(table, idx, engine) { const r = table[idx]; return !!r && engine >= 1 && engine <= 4 && r[engine - 1] > 0; }
+
+// Gibt null zurueck, wenn der Start in Ordnung ist, sonst { code, text } (deutscher Klartext fuer die Mail).
+function fleetLaunchProblem(fleet, commander) {
+    try {
+        const engine = Math.floor(Number(fleet.engineLevel) || 1);
+        if (engine < 1 || engine > 4) return { code: 'engine', text: 'ungültiger Antrieb' };
+        const w = flightCounts(fleet.warships, 10), s = flightCounts(fleet.ships, 6);
+        if (w.reduce((a, b) => a + b, 0) + s.reduce((a, b) => a + b, 0) <= 0) return null;     // leere Flotte: nichts zu pruefen
+        // 1) Antrieb erforscht?
+        const researched = [1, commander && commander.engine02, commander && commander.engine03, commander && commander.engine04];
+        if (engine >= 2 && !(Number(researched[engine - 1]) > 0)) return { code: 'engine', text: `Antrieb ${engine} ist nicht erforscht` };
+        // 2) Reichweite
+        const points = fleetDistancePoints(fleet.originCoord, fleet.destinationCoord);
+        if (points === null) return null;
+        if (points > FLIGHT_RANGE[engine] * 1.1) return { code: 'range', text: `Reichweite des Antriebs ${engine} überschritten (${points} Punkte)` };
+        // 3) Flieger + Traeger-Plaetze
+        let flyers = 0, capacity = 0, need = 0;
+        for (let i = 0; i < 10; i++) { if (!w[i]) continue; if (flightCanFly(FLIGHT_WARSHIP_FUEL, i, engine)) { flyers += w[i]; capacity += w[i] * FLIGHT_WARSHIP_SLOTS.transport[i]; } else need += w[i] * FLIGHT_WARSHIP_SLOTS.use[i]; }
+        for (let i = 0; i < 6; i++)  { if (!s[i]) continue; if (flightCanFly(FLIGHT_SHIP_FUEL, i, engine))    { flyers += s[i]; capacity += s[i] * FLIGHT_SHIP_SLOTS.transport[i]; }    else need += s[i] * FLIGHT_SHIP_SLOTS.use[i]; }
+        if (flyers === 0) return { code: 'noflyer', text: 'kein Schiff der Flotte fliegt diesen Antrieb' };
+        if (need > capacity) return { code: 'slots', text: 'zu wenig Träger-Plätze für die mitfliegenden Schiffe' };
+        // 4) Treibstoff + Ladung im Laderaum
+        let fuel = 0;
+        for (let i = 0; i < 10; i++) fuel += w[i] * flightFuelPerPoint(FLIGHT_WARSHIP_FUEL, i, engine);
+        for (let i = 0; i < 6; i++)  fuel += s[i] * flightFuelPerPoint(FLIGHT_SHIP_FUEL, i, engine);
+        const speedFactor = Math.min(1, Math.max(FLIGHT_MIN_FUEL_SPEED, Number(fleet.fuelFactor) || 1));   // Client: 100 % ... 25 % (langsamer = weniger Treibstoff, aber laengere Flugzeit)
+        fuel = Math.round(fuel * points * speedFactor);
+        const cargo = v2CargoCapacity(w, s);
+        const load = (Array.isArray(fleet.ressources) ? fleet.ressources : []).reduce((a, b) => a + (Number(b) > 0 ? Number(b) : 0), 0);
+        if (fuel + load > cargo) return { code: 'cargo', text: `Treibstoff (${fuel}) und Ladung (${load}) passen nicht in den Laderaum (${cargo})` };
+        // 5) Flugzeit
+        const dep = Date.parse(fleet.departureUtc), arr = Date.parse(fleet.arrivalUtc);
+        if (!Number.isFinite(dep) || !Number.isFinite(arr) || arr < dep) return { code: 'time', text: 'ungültige Abflug- oder Ankunftszeit' };
+        const expected = calculateFlightTime(fleet.originCoord, fleet.destinationCoord, engine, fleet.fuelFactor || 1);
+        if ((arr - dep) / 1000 < expected * FLIGHT_TIME_TOLERANCE) return { code: 'time', text: `Flugzeit zu kurz (${Math.round((arr - dep) / 1000)} s statt mindestens ${Math.round(expected * FLIGHT_TIME_TOLERANCE)} s)` };
+        return null;
+    } catch (e) {
+        console.error('[Flottenstart-Pruefung] Fehler (Flotte wird nicht blockiert):', e.message);
+        return null;
+    }
+}
+
+// Gemeinsame Behandlung bei Verstoss: Mail an den Besitzer + Log; die Aufrufer schicken die Flotte heim (buildReturnFleet).
+async function fleetLaunchRejected(commander, fleet, problem, log) {
+    console.warn(`[Flottenstart-Pruefung] Commander ${commander.commanderId} Flotte ${fleet.fleetId}: ${problem.code} - ${problem.text}`);
+    if (log) log.push(`Flottenstart ungueltig (${problem.code}): ${fleet.fleetId}`);
+    await sendMail(commander, 'Flottenstart ungültig', `Deine Flotte ${fleet.fleetId} nach ${fleet.destinationCoord} entspricht nicht den Flugregeln: ${problem.text}. Die Flotte kehrt nach ${fleet.originCoord} zurück.`, 1);   // LOCALIZE
+}
+// §60-ENDE
 
 // Kampfbericht-Mail — trägt jetzt NUR NOCH die reportId als Verweis,
 // nicht mehr den kompletten Bericht (der lebt jetzt dauerhaft in der DB).
@@ -9764,6 +9870,16 @@ function v2ResearchOf(commander) {
 function v2CargoCapacity(warships, ships) {
     let cap = 0;
     for (let i = 0; i < 10; i++) cap += (warships[i] || 0) * (V2_CARGO_WARSHIP[i] || 0);
+    for (let i = 0; i < 6; i++) cap += (ships[i] || 0) * (V2_CARGO_SHIP[i] || 0);
+    return cap;
+}
+
+// NEU 13.11.2026 (Nutzer, F3 "Beute-Anteil, Regler an einer Stelle"): Beute-Kapazitaet beim Pluendern = Laderaum der Zivilschiffe (voll)
+// + LOOT_WARSHIP_CARGO_SHARE des Laderaums der Kriegsschiffe ("Warships pluendern kaum"). Transport/Treibstoff nutzen weiter den vollen Laderaum (v2CargoCapacity).
+const LOOT_WARSHIP_CARGO_SHARE = 0.25;   // <- der EINE Regler (0 = Kriegsschiffe pluendern gar nicht, 1 = voller Laderaum wie vor dem 13.11.)
+function v2LootCapacity(warships, ships) {
+    let cap = 0;
+    for (let i = 0; i < 10; i++) cap += Math.floor((warships[i] || 0) * (V2_CARGO_WARSHIP[i] || 0) * LOOT_WARSHIP_CARGO_SHARE);
     for (let i = 0; i < 6; i++) cap += (ships[i] || 0) * (V2_CARGO_SHIP[i] || 0);
     return cap;
 }
@@ -12200,6 +12316,7 @@ function colIsPlanetAllowed(habitatLevel, n) {
 function colHabitatLevelRequired(n) { for (let l = 1; l <= 11; l++) if (colIsPlanetAllowed(l, n)) return l; return 11; }
 function colTerraformHours(habitatLevel) { const h = 24 - (Math.max(1, habitatLevel | 0) - 1); return h < 6 ? 6 : h; }
 function colResearchAllowed(targetLevel, otherLevel) { return (otherLevel | 0) >= targetLevel - 1; }
+const RESEARCH_MAX_LEVEL = 18;   // NEU 13.11.2026 (Nutzer): Alpha-Obergrenze fuer Forschungen, gleich wie ECON_MAX_BUILDING_LEVEL
 function colShipCostPercent(v, h, colonies) { return 100 + 2 * Math.max(0, v | 0) + 2 * Math.max(0, h | 0) + 10 * Math.max(0, (colonies | 0) - 2); }
 
 // Pruefung fuer /planet/claim. Rueckgabe { ok } oder { ok:false, status, error, retry? }.
@@ -12486,6 +12603,12 @@ function stationedBuildHomeFleet(ownerCommander, fromCoord, originCoord, fleet, 
 // ---- Ankunft einer Stationierungs-Flotte (Tick und /processFleet) ----
 // Rueckgabe: Rueckflug-Flotte (wenn die Stationierung nicht moeglich ist) oder null (stationiert). Aendert commander (Mail), Speichern macht der Aufrufer.
 async function processStationingArrival(playFabId, commander, fleet, now) {
+    // NEU 13.11.2026 (§60): Flottenstart serverseitig pruefen; Verstoss: nicht stationieren, Flotte kehrt heim
+    const launchProblem = fleetLaunchProblem(fleet, commander);
+    if (launchProblem) {
+        await fleetLaunchRejected(commander, fleet, launchProblem, null);
+        return buildReturnFleet(fleet, now, fleet.warships, fleet.ressources);
+    }
     let reason = null, hostRow = null;
     try {
         const r = await pool.query('SELECT owner_commander_id, kind, owner_name FROM planet_registry WHERE coord = $1', [fleet.destinationCoord]);
