@@ -2266,6 +2266,15 @@ async function getAllianceIdForCommander(commanderId) {
     return result.rows.length > 0 ? result.rows[0].alliance_id : null;
 }
 
+// NEU 13.11.2026: Mitglieder DERSELBEN Allianz greifen einander nicht an (true = kein Kampf). Steht bewusst ausserhalb des Kampfblocks (resolveCombat faengt Fehler ab).
+async function combatBlockedByAlliance(attackerId, ownerId) {
+    if (!(Number(attackerId) >= 1000000) || !(Number(ownerId) >= 1000000) || Number(attackerId) === Number(ownerId)) return false;
+    const mine = await getAllianceIdForCommander(attackerId);
+    if (!mine) return false;
+    const theirs = await getAllianceIdForCommander(ownerId);
+    return !!theirs && Number(mine) === Number(theirs);
+}
+
 // -------------------------------------------------------
 // Allianz-Anzeige-ID erzeugen: JJMMTT + Galaxie (2-stellig) +
 // fortlaufende Nummer (3-stellig, atomar aus Postgres-Sequenz).
@@ -7884,6 +7893,18 @@ async function resolveCombat(attackerPlayFabId, attackerCommander, attackerFleet
         } catch (e) {
             log.push(`Verteidiger ueber Register nicht lesbar: ${e.message}`);
         }
+    }
+
+    // NEU 13.11.2026 (Fund beim Zwei-Konten-Test; Entscheidung Claude: Allianzmitglieder greifen einander NICHT an): gehoert der Zielplanet einem Mitglied DERSELBEN Allianz
+    // wie der Angreifer, kommt es zu keinem Kampf - die Flotte fliegt unveraendert heim. Kann die Allianz nicht geprueft werden, geht der Angriff weiter (nie blockieren).
+    if (!expelMode && ownerInfo && Number(ownerInfo.ownerCommanderId) >= 1000000 && Number(ownerInfo.ownerCommanderId) !== Number(attackerCommander.commanderId)) {
+        try {
+            if (await combatBlockedByAlliance(attackerCommander.commanderId, ownerInfo.ownerCommanderId)) {
+                await upsertAttackTrace(attackerFleet.fleetId, { combat_processed_at: new Date(), combat_success: false });
+                await sendMail(attackerCommander, 'Angriff abgebrochen', `Auf ${destCoord} wohnt ${ownerInfo.ownerName || 'ein Mitglied deiner Allianz'}. Allianzmitglieder greifen einander nicht an - deine Flotte kehrt zurück.`, 1);   // LOCALIZE
+                return buildReturnFleet(attackerFleet, now, [...attackerFleet.warships], attackerFleet.ressources || [0,0,0,0,0]);
+            }
+        } catch (e) { log.push(`Allianzpruefung nicht moeglich: ${e.message}`); }
     }
 
     // NEU 21.10.2026 (§36): steht auf dem Ziel ein Piratenstuetzpunkt, verteidigt er mit Schiffen + Forschung seines Clans.
