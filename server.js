@@ -6901,7 +6901,7 @@ const BUILDING_ECONOMY = {
     0: { // Kommandozentrale — feste Grundproduktion, wächst NICHT mit Stufe.
          // NEU 21.10.2026: Tagessatz = Inhalt der Kleinen Kisten (5.000/7.500/10.000/7.500/2.500), Quelle Tools/Wirtschaft/sync_wirtschaft.js.
          // Die Lagerkapazitaet kommt jetzt aus econStorageCaps (3 Tagesertraege); baseStorageCapacity wird nur noch von getStorageCapacity (ALT) gelesen.
-        productionEarly: [[0.2893519], [0.4340278], [0.5787037], [0.4340278], [0.1446759]],
+        productionEarly: [[0.2893519], [0.4340278], [0.5787037], [0.4340278], [0]],
         scalesWithLevel: false,
         tierGrowthFactors: [],
         tierStepCounts: [],
@@ -7335,7 +7335,7 @@ function getCapacityMultiplier(level) {
 //   Katalog (Baukosten, HQ-Tagessatz) erzeugt Tools/Wirtschaft/sync_wirtschaft.js.
 // =====================================================================
 // WIRTSCHAFT-KATALOG-START (erzeugt von Tools/Wirtschaft/sync_wirtschaft.js - NICHT von Hand aendern)
-const ECON_HQ_DAILY = [5000,7500,10000,7500,2500];      // Kommandozentrale: feste Tagesproduktion Ress01-05 (= Kleine Kisten)
+const ECON_HQ_DAILY = [5000,7500,10000,7500,0];      // Kommandozentrale: feste Tagesproduktion Ress01-05 (= Kleine Kisten)
 const ECON_STORAGE_DAYS = 3;                         // Lager = so viele Tagesertraege (Ress01-04)
 const ECON_SHIP_BUILD_MINUTES = {"warship":{"0":300,"1":360,"2":420,"3":1800},"ship":{"1":120,"3":0.25}};   // Bauzeit je Schiff in Minuten (Basis aus den Schiffs-Assets, ohne Werft-Bonus) - Grundlage des ICC-Zeitaufschlags
 const ECON_MAX_BUILDING_LEVEL = 18;
