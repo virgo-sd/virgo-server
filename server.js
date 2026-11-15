@@ -15427,8 +15427,9 @@ async function sessionActive(playFabId) {
 async function sessionIsReplaced(playFabId, ticket) {
     if (!playFabId || !ticket) return false;
     const s = await sessionActive(playFabId);
+    if (!s.hash || s.replaced.length === 0) return false;   // kein Eintrag / nichts abgeloest: nie sperren (ohne Pruefsumme zu rechnen)
     const h = sessionTicketHash(ticket);
-    return !!s.hash && s.hash !== h && s.replaced.includes(h);
+    return s.hash !== h && s.replaced.includes(h);
 }
 
 async function sessionClaim(playFabId, ticket) {
