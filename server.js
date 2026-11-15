@@ -1725,6 +1725,7 @@ async function initDatabase() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_remember_tokens_playfab ON remember_tokens (playfab_id);`);
         // NEU 13.11.2026 (§59 EIN Geraet je Konto): welches Anmeldeticket (nur Pruefsumme) gilt gerade; fluechtig, nicht in DB_EXPORT_TABLES
         await pool.query(`CREATE TABLE IF NOT EXISTS active_sessions (playfab_id TEXT PRIMARY KEY, ticket_hash TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
+        await pool.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS replaced_hashes TEXT NOT NULL DEFAULT '';`);   // NEU 15.11.2026 (§59): nur wirklich abgeloeste Tickets sperren
         await pool.query(`CREATE TABLE IF NOT EXISTS planet_freed (id SERIAL PRIMARY KEY, coord TEXT NOT NULL, freed_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_planet_freed_time ON planet_freed (freed_at);`);
 
@@ -15387,7 +15388,10 @@ app.get('/account/email-status', async (req, res) => {
 //      EIN GERAET JE KONTO: Meldet sich ein Konto auf einem zweiten Geraet an, muss das erste abgemeldet werden. Nach jeder Anmeldung ruft der Client POST /session/claim
 //      (mit seinem Ticket); der Server merkt sich nur die PRUEFSUMME des Tickets je Konto (Tabelle active_sessions). Jede weitere Anfrage mit einem ANDEREN Ticket dieses Kontos
 //      wird mit 401 und code SESSION-ERSETZT abgewiesen (zentral in der Auth-Middleware und in marketIdentity/requireCaller); GET /session/check sagt dem Client, ob sein Ticket
-//      noch gilt (er fragt alle ~20 s). Konten ohne Eintrag (aeltere Clients, die nie "claimen") werden nicht eingeschraenkt. Grenze: Der Spielstand selbst wird vom Client
+//      noch gilt (er fragt alle ~20 s). FIX 15.11.2026: Gesperrt wird NUR ein Ticket, das schon einmal das aktive war und danach von einer anderen Anmeldung abgeloest wurde
+//      (Liste replaced_hashes). Vorher galt jedes fremde Ticket als abgeloest - auch die brandneue Anmeldung in den Sekunden vor ihrem claim; dadurch scheiterte
+//      "Angemeldet bleiben" (POST /auth/remember kam vor dem claim) und das Spiel zeigte "Auf einem anderen Geraet angemeldet", obwohl es kein anderes Geraet gab.
+//      Holt sich ein abgeloestes Geraet die Sitzung zurueck ("Hier angemeldet bleiben" = claim mit dem alten Ticket), kommt es von der Liste und das andere darauf. Konten ohne Eintrag (aeltere Clients, die nie "claimen") werden nicht eingeschraenkt. Grenze: Der Spielstand selbst wird vom Client
 //      direkt in PlayFab geschrieben - das Geraet wird deshalb sofort und ohne Speichern abgemeldet, sobald es die Ablösung bemerkt.
 //      PASSWORT SENDEN (POST /auth/forgot, ohne Anmeldung): immer dieselbe neutrale Antwort, sofort (kein Zeit-Orakel); danach im Hintergrund: gibt es zu der Adresse ein Konto ->
 //      PlayFabs Standard-Mail zum Passwort-Wechsel; gibt es keins -> "Rekrutierungs-Mail" (Einladung zur Registrierung, Deutsch/Englisch nach X-Lang) ueber den Mail-Dienst
@@ -15395,36 +15399,48 @@ app.get('/account/email-status', async (req, res) => {
 //      (nur als Pruefsumme im Speicher) und insgesamt je Tag begrenzt.
 // #####################################################################
 // SESSION59-START
-const sessionCache = new Map();   // playFabId -> { hash, at }
+const sessionCache = new Map();   // playFabId -> { hash, replaced: [hash...], at }
 const SESSION_CACHE_MS = 20000;
+const SESSION_REPLACED_KEEP = 20;   // so viele abgeloeste Tickets je Konto merken (nur Pruefsummen)
 function sessionTicketHash(ticket) { return require('crypto').createHash('sha256').update(String(ticket)).digest('hex').slice(0, 32); }
 
-async function sessionActiveHash(playFabId) {
-    const c = sessionCache.get(playFabId);
-    if (c && Date.now() - c.at < SESSION_CACHE_MS) return c.hash;
-    let hash = null;
-    try {
-        const r = await pool.query('SELECT ticket_hash FROM active_sessions WHERE playfab_id = $1', [playFabId]);
-        hash = r.rows.length > 0 ? r.rows[0].ticket_hash : null;
-    } catch (e) { return c ? c.hash : null; }   // Tabelle/DB nicht lesbar: nie aussperren
-    if (sessionCache.size > 20000) sessionCache.clear();
-    sessionCache.set(playFabId, { hash, at: Date.now() });
-    return hash;
+async function sessionReadRow(playFabId) {
+    const r = await pool.query('SELECT ticket_hash, replaced_hashes FROM active_sessions WHERE playfab_id = $1', [playFabId]);
+    if (r.rows.length === 0) return { hash: null, replaced: [] };
+    return { hash: r.rows[0].ticket_hash, replaced: String(r.rows[0].replaced_hashes || '').split(',').filter(Boolean) };
 }
 
-// true = fuer dieses Konto gilt inzwischen ein ANDERES Ticket (anderes Geraet hat sich angemeldet)
+async function sessionActive(playFabId) {
+    const c = sessionCache.get(playFabId);
+    if (c && Date.now() - c.at < SESSION_CACHE_MS) return c;
+    let v;
+    try { v = await sessionReadRow(playFabId); }
+    catch (e) { return c || { hash: null, replaced: [] }; }   // Tabelle/DB nicht lesbar: nie aussperren
+    if (sessionCache.size > 20000) sessionCache.clear();
+    const entry = { hash: v.hash, replaced: v.replaced, at: Date.now() };
+    sessionCache.set(playFabId, entry);
+    return entry;
+}
+
+// true = dieses Ticket war schon einmal das aktive dieses Kontos und wurde inzwischen von einer anderen Anmeldung abgeloest
+// (ein noch nie angemeldetes, brandneues Ticket gilt NICHT als abgeloest - es meldet sich gleich selbst per claim an)
 async function sessionIsReplaced(playFabId, ticket) {
     if (!playFabId || !ticket) return false;
-    const active = await sessionActiveHash(playFabId);
-    return !!active && active !== sessionTicketHash(ticket);
+    const s = await sessionActive(playFabId);
+    const h = sessionTicketHash(ticket);
+    return !!s.hash && s.hash !== h && s.replaced.includes(h);
 }
 
 async function sessionClaim(playFabId, ticket) {
     const hash = sessionTicketHash(ticket);
+    const old = await sessionReadRow(playFabId);
+    let replaced = old.replaced.filter(x => x !== hash);          // holt sich ein abgeloestes Geraet die Sitzung zurueck, gilt es wieder
+    if (old.hash && old.hash !== hash) replaced.push(old.hash);   // das bisher aktive Geraet ist ab jetzt abgeloest
+    replaced = replaced.slice(-SESSION_REPLACED_KEEP);
     await pool.query(
-        `INSERT INTO active_sessions (playfab_id, ticket_hash, claimed_at) VALUES ($1, $2, now())
-         ON CONFLICT (playfab_id) DO UPDATE SET ticket_hash = EXCLUDED.ticket_hash, claimed_at = now()`, [playFabId, hash]);
-    sessionCache.set(playFabId, { hash, at: Date.now() });
+        `INSERT INTO active_sessions (playfab_id, ticket_hash, replaced_hashes, claimed_at) VALUES ($1, $2, $3, now())
+         ON CONFLICT (playfab_id) DO UPDATE SET ticket_hash = EXCLUDED.ticket_hash, replaced_hashes = EXCLUDED.replaced_hashes, claimed_at = now()`, [playFabId, hash, replaced.join(',')]);
+    sessionCache.set(playFabId, { hash, replaced, at: Date.now() });
 }
 
 async function sessionCaller(req, res) {
