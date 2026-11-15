@@ -8603,6 +8603,10 @@ const RESEARCH62_PARENTS = {
     6: [[5, 0]], 7: [[6, 0]], 9: [[8, 0]], 10: [[9, 0]],
     11: [[23, 0]], 12: [[11, 0]], 13: [[12, 0]], 14: [[13, 0]]
 };
+// Zugang (Nutzer 15.11.2026): ohne Kernforschung des Reiters auf mindestens Stufe 1 keine andere Forschung des Reiters (auch bei alten Stufen)
+const RESEARCH62_CORE_OF = { 0: 21, 1: 21, 2: 21, 3: 21, 4: 21, 18: 21, 17: 21, 19: 21,
+    5: 22, 6: 22, 7: 22, 8: 22, 9: 22, 10: 22, 16: 22, 15: 22, 20: 22,
+    11: 23, 12: 23, 13: 23, 14: 23 };
 const RESEARCH62_LOCKED = [14];
 const RESEARCH62_ENGINE_FACTOR = { 11: 1, 12: 1.2, 13: 1.4, 14: 1.6 };
 const RESEARCH62_ENGINE_ANCHORS = [[1, 6], [5, 24], [10, 48], [15, 96], [16, 168], [17, 336], [18, 504]];   // Zielstufe -> Stunden (Orbitalantrieb)
@@ -8633,6 +8637,8 @@ function research62Problem(commander, ar) {
     if (!ar) return null;
     const type = Number(ar.type), level = Math.floor(Number(ar.targetLevel) || 0);
     if (RESEARCH62_LOCKED.includes(type)) return { code: 'gesperrt', text: (RESEARCH62_NAMES[type] || 'diese Forschung') + ' ist in der Alpha noch gesperrt' };
+    const core = RESEARCH62_CORE_OF[type];
+    if (core !== undefined && research62Level(commander, core) < 1) return { code: 'baum', text: (RESEARCH62_NAMES[core] || 'die Kernforschung') + ' braucht mindestens Stufe 1' };
     for (const [p, off] of (RESEARCH62_PARENTS[type] || [])) {
         const need = Math.max(1, level - off);
         if (research62Level(commander, p) < need) return { code: 'baum', text: (RESEARCH62_NAMES[p] || 'die Voraussetzung') + ' braucht mindestens Stufe ' + need };
