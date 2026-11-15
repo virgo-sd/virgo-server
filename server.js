@@ -8584,7 +8584,7 @@ function treasuryProtectedCrates(crates, level, economicsLevel) { return Math.fl
 //      (null = Schattenmodus, nur Protokoll - so verliert niemand Rohstoffe, der noch mit dem alten Spiel-Client nach alten Regeln forscht); 30 Tage danach fuer alle.
 //      ENTSCHEIDUNG offen beim Veroeffentlichen des neuen Clients: Datum setzen.
 // #####################################################################
-const RESEARCH62_ENFORCE_SINCE = null;   // z. B. '2026-11-16T00:00:00Z' - erst setzen, wenn der neue Client live ist
+const RESEARCH62_ENFORCE_SINCE = '2026-11-15T16:00:00Z';   // 15.11.2026: Client-Build 2026.11.15-1355 ist live (13:56); 3 h Puffer fuer Spieler mit altem, noch offenem Spiel
 const RESEARCH62_ALL_AFTER_DAYS = 30;
 const RESEARCH62_FIELDS = { 0: 'ress01', 1: 'ress02', 2: 'ress03', 3: 'ress04', 4: 'ress05', 5: 'weapon01', 6: 'weapon02', 7: 'weapon03', 8: 'shield01', 9: 'shield02', 10: 'shield03',
     11: 'engine01', 12: 'engine02', 13: 'engine03', 14: 'engine04', 15: 'recycling', 16: 'reparatur', 17: 'terraforming', 18: 'verwaltung', 19: 'architektur', 20: 'ingenieurwesen',
