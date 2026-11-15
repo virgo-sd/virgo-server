@@ -6820,7 +6820,15 @@ async function serverTickHandler(req, res) {
                     } else if (coupledOther !== null && !colResearchAllowed(rLevel, coupledOther)) {
                         console.warn(`[Forschung] Kopplung verletzt: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} bei Gegenstueck ${coupledOther} - verworfen`);
                     } else {
-                        applyResearch(commander, rType, rLevel);
+                        // NEU 15.11.2026 (§62): Techtree, in der Alpha gesperrte Forschung, Mindest-Forschungszeit
+                        const p62 = research62Problem(commander, commander.activeResearch);
+                        if (p62 && research62Enforced(commander.activeResearch, now)) {
+                            console.warn(`[Forschung §62] ${p62.code}: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} - verworfen (${p62.text})`);
+                            await sendMail(commander, 'Forschung verworfen', `Die Forschung (Stufe ${rLevel}) wurde nicht übernommen: ${p62.text}.`, 1);   // LOCALIZE
+                        } else {
+                            if (p62) console.log(`[Forschung §62 Schatten] ${p62.code}: Commander ${commander.commanderId} Typ ${rType} Stufe ${rLevel} (${p62.text}) - noch uebernommen`);
+                            applyResearch(commander, rType, rLevel);
+                        }
                     }
                     commander.activeResearch = null;
                     changed = true;
@@ -7008,7 +7016,8 @@ function hsCalcResearchScore(commander) {
         commander.ress01, commander.ress02, commander.ress03, commander.ress04, commander.ress05,
         commander.recycling, commander.reparatur,
         commander.terraforming, commander.verwaltung, commander.architektur,
-        commander.ingenieurwesen, commander.wirtschaftslehre
+        commander.ingenieurwesen, commander.wirtschaftslehre,
+        commander.militaertechnik, commander.zivileraumfahrt   // NEU 15.11.2026 (§62)
     ];
     let score = 0;
     for (const lvl of levels) score += hsCalcResearchPoints(lvl);
@@ -8564,6 +8573,87 @@ function treasuryProtectionPercent(level, economicsLevel) {
 function treasuryProtectedCrates(crates, level, economicsLevel) { return Math.floor(Math.max(0, Math.floor(Number(crates) || 0)) * treasuryProtectionPercent(level, economicsLevel) / 100); }
 // §61-ENDE
 
+// #####################################################################
+// §62  FORSCHUNGS-BAUM (NEU 15.11.2026, Nutzer: Forschungs-Umbau; Vault: "Forschung - Techtree-Umbau (15.11.2026)")
+//      Spiegel von Assets/Skripts/ResearchRules.cs (Test research62_test.js vergleicht beide). Geprueft wird beim ABSCHLUSS im Tick (der Client startet die Forschung):
+//       - Baum: abhaengige Forschung nie hoeher als ihre Voraussetzung (Stufe N braucht die Voraussetzung auf N; Habitatentwicklung braucht Verwaltung N-1, mindestens 1)
+//       - gesperrt in der Alpha: Raumfaltung (Typ 14) - erst mit Galaxie 2
+//       - Mindestzeit: Dauer (Ende - Start) mindestens 95 % der kuerzest moeglichen Zeit (Antriebe: fester Fahrplan ohne Labor-Bonus; sonst mit dem
+//         groesstmoeglichen Labor-Bonus -50 %), damit ein veraenderter Client die Zeit nicht abkuerzen kann.
+//      Verstoss: Forschung wird verworfen (Mail "Forschung verworfen"). UEBERGANG: Gilt nur fuer Forschungen, die ab RESEARCH62_ENFORCE_SINCE gestartet wurden
+//      (null = Schattenmodus, nur Protokoll - so verliert niemand Rohstoffe, der noch mit dem alten Spiel-Client nach alten Regeln forscht); 30 Tage danach fuer alle.
+//      ENTSCHEIDUNG offen beim Veroeffentlichen des neuen Clients: Datum setzen.
+// #####################################################################
+const RESEARCH62_ENFORCE_SINCE = null;   // z. B. '2026-11-16T00:00:00Z' - erst setzen, wenn der neue Client live ist
+const RESEARCH62_ALL_AFTER_DAYS = 30;
+const RESEARCH62_FIELDS = { 0: 'ress01', 1: 'ress02', 2: 'ress03', 3: 'ress04', 4: 'ress05', 5: 'weapon01', 6: 'weapon02', 7: 'weapon03', 8: 'shield01', 9: 'shield02', 10: 'shield03',
+    11: 'engine01', 12: 'engine02', 13: 'engine03', 14: 'engine04', 15: 'recycling', 16: 'reparatur', 17: 'terraforming', 18: 'verwaltung', 19: 'architektur', 20: 'ingenieurwesen',
+    21: 'wirtschaftslehre', 22: 'militaertechnik', 23: 'zivileraumfahrt' };
+const RESEARCH62_NAMES = { 0: 'Fusionsmeiler', 1: 'Kryo-Extraktion', 2: 'Erzschmiede', 3: 'Präzisionsfertigung', 4: 'Clearing-Netz', 5: 'Railgun-Ballistik', 6: 'Zielsuchtechnik',
+    7: 'Plasma-Optik', 8: 'Verbundpanzerung', 9: 'Abfangsysteme', 10: 'Schildmatrix', 11: 'Orbitalantrieb', 12: 'Fusionsantrieb', 13: 'Aether-Antrieb', 14: 'Raumfaltung',
+    15: 'Trümmerbergung', 16: 'Feldreparatur', 17: 'Habitatentwicklung', 18: 'Verwaltung', 19: 'Architektur', 20: 'Ingenieurswesen', 21: 'Wirtschaftslehre',
+    22: 'Militärtechnik', 23: 'Zivile Raumfahrt' };
+// Typ -> [[Voraussetzung, Versatz]]  (Versatz 0: Voraussetzung >= Zielstufe; 1: >= Zielstufe - 1, mindestens 1)
+const RESEARCH62_PARENTS = {
+    0: [[21, 0]], 1: [[21, 0]], 2: [[21, 0]], 3: [[21, 0]], 18: [[21, 0]],
+    4: [[0, 0], [1, 0], [2, 0], [3, 0]],
+    17: [[18, 1]], 19: [[18, 0]],
+    5: [[22, 0]], 8: [[22, 0]], 15: [[22, 0]], 16: [[22, 0]], 20: [[22, 0]],
+    6: [[5, 0]], 7: [[6, 0]], 9: [[8, 0]], 10: [[9, 0]],
+    11: [[23, 0]], 12: [[11, 0]], 13: [[12, 0]], 14: [[13, 0]]
+};
+const RESEARCH62_LOCKED = [14];
+const RESEARCH62_ENGINE_FACTOR = { 11: 1, 12: 1.2, 13: 1.4, 14: 1.6 };
+const RESEARCH62_ENGINE_ANCHORS = [[1, 6], [5, 24], [10, 48], [15, 96], [16, 168], [17, 336], [18, 504]];   // Zielstufe -> Stunden (Orbitalantrieb)
+const RESEARCH62_CAPSTONE = 2;            // Stufe 18 (ausser Antriebe): doppelte Zeit
+const RESEARCH62_BASE_HOURS = 1, RESEARCH62_FACTOR = 1.5, RESEARCH62_FACTOR5 = 2, RESEARCH62_MAX_LAB_BONUS = 0.5;   // wie die Forschungs-Assets (alle gleich)
+
+function research62Level(commander, type) { const f = RESEARCH62_FIELDS[type]; const v = f && commander ? Number(commander[f]) : 0; return Number.isFinite(v) ? v : 0; }
+function research62EngineHours(level) {
+    const l = Math.min(18, Math.max(1, Math.floor(Number(level) || 1)));
+    const A = RESEARCH62_ENGINE_ANCHORS;
+    for (let i = 0; i < A.length - 1; i++) {
+        const [a, ha] = A[i], [b, hb] = A[i + 1];
+        if (l >= a && l <= b) return ha * Math.pow(hb / ha, (l - a) / (b - a));
+    }
+    return A[0][1];
+}
+// Forschungszeit in Sekunden (wie ResearchRules.TimeSeconds); labBonus 0..0.5
+function research62Seconds(type, level, labBonus) {
+    if (RESEARCH62_ENGINE_FACTOR[type] !== undefined) return Math.round(research62EngineHours(level) * RESEARCH62_ENGINE_FACTOR[type] * 60) * 60;
+    const l = Math.max(1, Math.floor(Number(level) || 1));
+    let t = RESEARCH62_BASE_HOURS * 3600 * Math.pow(RESEARCH62_FACTOR, l - 1) * Math.pow(RESEARCH62_FACTOR5, Math.floor((l - 1) / 5));
+    t *= (1 - Math.min(RESEARCH62_MAX_LAB_BONUS, Math.max(0, Number(labBonus) || 0)));
+    if (l >= 18) t *= RESEARCH62_CAPSTONE;
+    return t;
+}
+// null = in Ordnung, sonst { code, text }
+function research62Problem(commander, ar) {
+    if (!ar) return null;
+    const type = Number(ar.type), level = Math.floor(Number(ar.targetLevel) || 0);
+    if (RESEARCH62_LOCKED.includes(type)) return { code: 'gesperrt', text: (RESEARCH62_NAMES[type] || 'diese Forschung') + ' ist in der Alpha noch gesperrt' };
+    for (const [p, off] of (RESEARCH62_PARENTS[type] || [])) {
+        const need = Math.max(1, level - off);
+        if (research62Level(commander, p) < need) return { code: 'baum', text: (RESEARCH62_NAMES[p] || 'die Voraussetzung') + ' braucht mindestens Stufe ' + need };
+    }
+    const start = Date.parse(ar.startTimeUtc), end = Date.parse(ar.endTimeUtc);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+        const min = research62Seconds(type, level, RESEARCH62_MAX_LAB_BONUS);
+        if ((end - start) / 1000 < min * 0.95) return { code: 'zeit', text: 'die Forschungszeit war zu kurz' };
+    } else return { code: 'zeit', text: 'die Forschungszeit fehlt' };
+    return null;
+}
+function research62Enforced(ar, now) {
+    if (!RESEARCH62_ENFORCE_SINCE) return false;
+    const since = Date.parse(RESEARCH62_ENFORCE_SINCE);
+    if (!Number.isFinite(since)) return false;
+    const n = now instanceof Date ? now.getTime() : Date.now();
+    if (n >= since + RESEARCH62_ALL_AFTER_DAYS * 86400000) return true;
+    const start = Date.parse(ar && ar.startTimeUtc);
+    return !Number.isFinite(start) || start >= since;
+}
+// §62-ENDE
+
 // Kampfbericht-Mail — trägt jetzt NUR NOCH die reportId als Verweis,
 // nicht mehr den kompletten Bericht (der lebt jetzt dauerhaft in der DB).
 async function sendCombatMail(commander, report, isAttackerMail, participant, isPlanetOwner) {
@@ -8712,7 +8802,8 @@ function applyResearch(commander, type, level) {
         8:'shield01',9:'shield02',10:'shield03',
         11:'engine01',12:'engine02',13:'engine03',14:'engine04',
         15:'recycling',16:'reparatur',17:'terraforming',
-        18:'verwaltung',19:'architektur',20:'ingenieurwesen',21:'wirtschaftslehre'
+        18:'verwaltung',19:'architektur',20:'ingenieurwesen',21:'wirtschaftslehre',
+        22:'militaertechnik',23:'zivileraumfahrt'   // NEU 15.11.2026 (§62): Kernforschungen Militaer / Technologie
     };
     if (map[type]) commander[map[type]] = level;
 }
@@ -12954,7 +13045,7 @@ const ACHV_MISMATCH_WINDOW_MINUTES = 10;
 const ACHV_TUTORIAL_DONE_STEP = 100;      // = TutorialManager.StepDone im Client
 const ACHV_SMALL_CRATES = ['crate_res_0', 'crate_res_1', 'crate_res_2', 'crate_res_3', 'crate_res_4'];
 const ACHV_RESEARCH_FIELDS = ['ress01', 'ress02', 'ress03', 'ress04', 'ress05', 'weapon01', 'weapon02', 'weapon03', 'shield01', 'shield02', 'shield03',
-    'engine01', 'engine02', 'engine03', 'engine04', 'recycling', 'reparatur', 'terraforming', 'verwaltung', 'architektur', 'ingenieurwesen', 'wirtschaftslehre'];
+    'engine01', 'engine02', 'engine03', 'engine04', 'recycling', 'reparatur', 'terraforming', 'verwaltung', 'architektur', 'ingenieurwesen', 'wirtschaftslehre', 'militaertechnik', 'zivileraumfahrt'];   // 15.11.2026: + Kernforschungen (§62)
 
 // ACHV-KATALOG-START (erzeugt von Tools/Erfolge/sync.js aus erfolge_katalog.js - NICHT von Hand aendern)
 const ACHV_CATALOG = [
